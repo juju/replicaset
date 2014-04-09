@@ -248,6 +248,7 @@ func MasterHostPort(session *mgo.Session) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	logger.Infof("MasterHostPort returned %#v", results)
 	return results.PrimaryAddress, nil
 }
 

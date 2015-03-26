@@ -1,3 +1,6 @@
+// Copyright 2013-2015 Canonical Ltd.
+// Licensed under the LGPLv3, see LICENCE file for details.
+
 package replicaset
 
 import (

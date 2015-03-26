@@ -1,6 +1,8 @@
 // Copyright 2013-2015 Canonical Ltd.
 // Licensed under the LGPLv3, see LICENCE file for details.
 
+// Package replicaset provides convenience functions and structures for
+// creating and managing MongoDB replica sets via the mgo driver.
 package replicaset
 
 import (

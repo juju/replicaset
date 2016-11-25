@@ -38,11 +38,6 @@ const (
 	// initiateAttemptStatusDelay is the amount of time to sleep between failed
 	// attempts to replSetGetStatus.
 	initiateAttemptStatusDelay = 500 * time.Millisecond
-
-	// rsMembersUnreachableError is the error message returned from mongo
-	// when it thinks that replicaset members are unreachable. This can
-	// occur if replSetInitiate is executed shortly after starting up mongo.
-	rsMembersUnreachableError = "all members and seeds must be reachable to initiate set"
 )
 
 var logger = loggo.GetLogger("juju.replicaset")
@@ -51,6 +46,21 @@ var (
 	getCurrentStatus = CurrentStatus
 	isReady          = IsReady
 )
+
+// attemptInitiate will attempt to initiate a mongodb replicaset with each of
+// the given configs, returning as soon as one config is successful.
+func attemptInitiate(monotonicSession *mgo.Session, cfg []Config) error {
+	var err error
+	for _, c := range cfg {
+		logger.Infof("Initiating replicaset with config %#v", c)
+		if err = monotonicSession.Run(bson.D{{"replSetInitiate", c}}, nil); err != nil {
+			logger.Infof("Unsuccessful attempt to initiate replicaset: %v", err)
+			continue
+		}
+		return nil
+	}
+	return err
+}
 
 // Initiate sets up a replica set with the given replica set name with the
 // single given member.  It need be called only once for a given mongo replica
@@ -66,21 +76,35 @@ func Initiate(session *mgo.Session, address, name string, tags map[string]string
 	monotonicSession := session.Clone()
 	defer monotonicSession.Close()
 	monotonicSession.SetMode(mgo.Monotonic, true)
-	cfg := Config{
-		Name:    name,
-		Version: 1,
-		Members: []Member{{
-			Id:      1,
-			Address: fixIpv6Address(address),
-			Tags:    tags,
-		}},
+	// We don't know mongod's ability to use a correct IPv6 addr format
+	// until the server is started, but we need to know before we can start
+	// it. Try the older, incorrect format, if the correct format fails.
+	cfg := []Config{
+		Config{
+			Name:    name,
+			Version: 1,
+			Members: []Member{{
+				Id:      1,
+				Address: address,
+				Tags:    tags,
+			}},
+		},
+		Config{
+			Name:    name,
+			Version: 1,
+			Members: []Member{{
+				Id:      1,
+				Address: formatIPv6AddressWithoutBrackets(address),
+				Tags:    tags,
+			}},
+		},
 	}
-	logger.Infof("Initiating replicaset with config %#v", cfg)
+
 	var err error
+	// Attempt replSetInitiate, with potential retries.
 	for i := 0; i < maxInitiateAttempts; i++ {
 		monotonicSession.Refresh()
-		err = monotonicSession.Run(bson.D{{"replSetInitiate", cfg}}, nil)
-		if err != nil && err.Error() == rsMembersUnreachableError {
+		if err = attemptInitiate(monotonicSession, cfg); err != nil {
 			time.Sleep(initiateAttemptDelay)
 			continue
 		}
@@ -167,11 +191,20 @@ func applyReplSetConfig(cmd string, session *mgo.Session, oldconfig, newconfig *
 	logger.Debugf("%s() changing replica set\nfrom %s\n  to %s",
 		cmd, fmtConfigForLog(oldconfig), fmtConfigForLog(newconfig))
 
-	// newConfig here is internal and safe to mutate
-	for index, member := range newconfig.Members {
-		newconfig.Members[index].Address = fixIpv6Address(member.Address)
+	buildInfo, err := session.BuildInfo()
+	if err != nil {
+		return err
 	}
-	err := session.Run(bson.D{{"replSetReconfig", newconfig}}, nil)
+	// https://jira.mongodb.org/browse/SERVER-5436
+	if !buildInfo.VersionAtLeast(2, 7, 4) {
+		// newConfig here is internal and safe to mutate
+		for index, member := range newconfig.Members {
+			newconfig.Members[index].Address = formatIPv6AddressWithoutBrackets(member.Address)
+			logger.Debugf("replica set using IP addr %s",
+				newconfig.Members[index].Address)
+		}
+	}
+	err = session.Run(bson.D{{"replSetReconfig", newconfig}}, nil)
 	if err == io.EOF {
 		// If the primary changes due to replSetReconfig, then all
 		// current connections are dropped.
@@ -315,10 +348,10 @@ func IsMaster(session *mgo.Session) (*IsMasterResults, error) {
 		return nil, err
 	}
 
-	results.Address = unFixIpv6Address(results.Address)
-	results.PrimaryAddress = unFixIpv6Address(results.PrimaryAddress)
+	results.Address = formatIPv6AddressWithBrackets(results.Address)
+	results.PrimaryAddress = formatIPv6AddressWithBrackets(results.PrimaryAddress)
 	for index, address := range results.Addresses {
-		results.Addresses[index] = unFixIpv6Address(address)
+		results.Addresses[index] = formatIPv6AddressWithBrackets(address)
 	}
 	return results, nil
 }
@@ -367,7 +400,7 @@ func currentConfig(session *mgo.Session) (*Config, error) {
 
 	members := make([]Member, len(cfg.Members), len(cfg.Members))
 	for index, member := range cfg.Members {
-		member.Address = unFixIpv6Address(member.Address)
+		member.Address = formatIPv6AddressWithBrackets(member.Address)
 		members[index] = member
 	}
 	cfg.Members = members
@@ -391,7 +424,7 @@ func CurrentStatus(session *mgo.Session) (*Status, error) {
 	}
 
 	for index, member := range status.Members {
-		status.Members[index].Address = unFixIpv6Address(member.Address)
+		status.Members[index].Address = formatIPv6AddressWithBrackets(member.Address)
 	}
 	return status, nil
 }
@@ -557,17 +590,19 @@ func (state MemberState) String() string {
 	return memberStateStrings[state]
 }
 
-// Turn normal ipv6 addresses into the "bad format" that mongo requires us
-// to use. (Mongo can't parse square brackets in ipv6 addresses.)
-func fixIpv6Address(address string) string {
+// formatIPv6AddressWithoutBrackets turns correctly formatted IPv6 addresses
+// into the "bad format" (without brackets around the address) that mongo <2.7
+// require use.
+func formatIPv6AddressWithoutBrackets(address string) string {
 	address = strings.Replace(address, "[", "", 1)
 	address = strings.Replace(address, "]", "", 1)
 	return address
 }
 
-// Turn "bad format" ipv6 addresses ("::1:port"), that mongo uses,  into good
-// format addresses ("[::1]:port").
-func unFixIpv6Address(address string) string {
+// formatIPv6AddressWithBrackets turns the "bad format" IPv6 addresses
+// ("<addr>:<port>") that mongo <2.7 uses into correctly format addresses
+// ("[<addr>]:<port>").
+func formatIPv6AddressWithBrackets(address string) string {
 	if strings.Count(address, ":") >= 2 && strings.Count(address, "[") == 0 {
 		lastColon := strings.LastIndex(address, ":")
 		host := address[:lastColon]

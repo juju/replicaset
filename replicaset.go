@@ -307,6 +307,12 @@ func Set(session *mgo.Session, members []Member) error {
 			max = m.Id
 		}
 	}
+	// Also check if any of the members being passed in already have an Id that we would be reusing.
+	for _, m := range members {
+		if m.Id > max {
+			max = m.Id
+		}
+	}
 
 	for x, m := range members {
 		if id, ok := ids[m.Address]; ok {

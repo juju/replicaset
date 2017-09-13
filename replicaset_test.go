@@ -257,7 +257,11 @@ func assertAddRemoveSet(c *gc.C, root *testing.MgoInstance, getAddr func(*testin
 
 	// now let's mix it up and set the new members to a mix of the previous
 	// plus the new arbiter
-	mems = []Member{members[3], mems[2], mems[0], members[4]}
+	// Also have an explicitly large member Id to make sure we don't have possible
+	// collisions
+	mem4 := members[4]
+	mem4.Id = 10
+	mems = []Member{members[3], mems[2], mems[0], mem4}
 	attemptLoop(c, strategy, "Set()", func() error {
 		err := Set(session, mems)
 		if err != nil {
@@ -278,8 +282,8 @@ func assertAddRemoveSet(c *gc.C, root *testing.MgoInstance, getAddr func(*testin
 
 	// any new members will get an id of max(other_ids...)+1
 	expectedMembers = []Member{members[3], expectedMembers[2], expectedMembers[0], members[4]}
-	expectedMembers[0].Id = 4
-	expectedMembers[3].Id = 5
+	expectedMembers[0].Id = 11
+	expectedMembers[3].Id = 10
 
 	attemptLoop(c, strategy, "CurrentMembers()", func() error {
 		var err error

@@ -55,12 +55,8 @@ var _ = gc.Suite(&MongoSuite{})
 func (s *MongoSuite) SetUpTest(c *gc.C) {
 	s.IsolationSuite.SetUpTest(c)
 	s.root = newServer(c)
+	s.AddCleanup(func(c *gc.C) { s.root.Destroy() })
 	dialAndTestInitiate(c, s.root, s.root.Addr())
-}
-
-func (s *MongoSuite) TearDownTest(c *gc.C) {
-	s.root.Destroy()
-	s.IsolationSuite.TearDownTest(c)
 }
 
 var initialTags = map[string]string{"foo": "bar"}

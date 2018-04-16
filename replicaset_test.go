@@ -624,8 +624,10 @@ func (s *MongoSuite) TestStepDownPrimary(c *gc.C) {
 	attemptLoop(c, strategy, "Add()", func() error {
 		return Add(session, Member{
 			Address: s1.Addr(),
+			Tags:    map[string]string{"s1": "s1"},
 		}, Member{
 			Address: s2.Addr(),
+			Tags:    map[string]string{"s2": "s2"},
 		})
 	})
 	mems, err := CurrentMembers(session)
@@ -637,9 +639,11 @@ func (s *MongoSuite) TestStepDownPrimary(c *gc.C) {
 	}, {
 		Id:      2,
 		Address: s1.Addr(),
+		Tags:    map[string]string{"s1": "s1"},
 	}, {
 		Id:      3,
 		Address: s2.Addr(),
+		Tags:    map[string]string{"s2": "s2"},
 	}})
 	// find the current primary
 	initialPrimary := findPrimary(c, session)

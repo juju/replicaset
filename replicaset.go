@@ -430,10 +430,13 @@ func StepDownPrimary(session *mgo.Session) error {
 	defer strictSession.Close()
 	// StepDown can only be called on the primary
 	session.SetMode(mgo.Primary, true)
-	// replSetStepDown can take a number of arguments, such as "number of seconds to wait for a secondary to become
-	// up-to-date", "how long to force the current primary to not be primary", and "force" whether or not the primary
-	// should be demoted right now. But we just use the defaults for all of those.
-	err := session.Run("replSetStepDown", nil)
+	// replSetStepDown takes a few optional parameters that vary based on what
+	// version of Mongo is running. In Mongo 2.4 it just takes the "step down
+	// seconds" which claims to default to 60s.
+	// In 3.2 it can also take secondaryCatchUpPeriodSecs which is supposed to
+	// start at 10s. However, testing shows that not passing either gives:
+	// err{"stepdown period must be longer than secondaryCatchUpPeriodSecs"}
+	err := session.Run(bson.D{{"replSetStepDown", 60.0}}, nil)
 	// we expect to get io.EOF so don't treat it as a failure.
 	if err == io.EOF {
 		return nil

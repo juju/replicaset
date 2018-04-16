@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"strings"
 	stdtesting "testing"
 	"time"
 
@@ -54,12 +55,8 @@ var _ = gc.Suite(&MongoSuite{})
 func (s *MongoSuite) SetUpTest(c *gc.C) {
 	s.IsolationSuite.SetUpTest(c)
 	s.root = newServer(c)
+	s.AddCleanup(func(c *gc.C) { s.root.Destroy() })
 	dialAndTestInitiate(c, s.root, s.root.Addr())
-}
-
-func (s *MongoSuite) TearDownTest(c *gc.C) {
-	s.root.Destroy()
-	s.IsolationSuite.TearDownTest(c)
 }
 
 var initialTags = map[string]string{"foo": "bar"}
@@ -597,6 +594,95 @@ func (s *MongoSuite) TestCurrentStatus(c *gc.C) {
 func closeEnough(expected, obtained time.Time) bool {
 	t := obtained.Sub(expected)
 	return (-500*time.Millisecond) < t && t < (500*time.Millisecond)
+}
+
+func findPrimary(c *gc.C, session *mgo.Session) int {
+	status, err := CurrentStatus(session)
+	c.Assert(err, jc.ErrorIsNil)
+	for i, m := range status.Members {
+		if m.State == PrimaryState {
+			return i
+		}
+	}
+	return -1
+}
+
+func (s *MongoSuite) TestStepDownPrimary(c *gc.C) {
+	session := s.root.MustDial()
+	defer func() {
+		if session != nil {
+			session.Close()
+			session = nil
+		}
+	}()
+	s0 := s.root
+	s1 := newServer(c)
+	defer s1.Destroy()
+	s2 := newServer(c)
+	defer s2.Destroy()
+	strategy := utils.AttemptStrategy{Total: time.Minute * 2, Delay: time.Millisecond * 500}
+	attemptLoop(c, strategy, "Add()", func() error {
+		return Add(session, Member{
+			Address: s1.Addr(),
+			Tags:    map[string]string{"s1": "s1"},
+		}, Member{
+			Address: s2.Addr(),
+			Tags:    map[string]string{"s2": "s2"},
+		})
+	})
+	mems, err := CurrentMembers(session)
+	c.Assert(err, jc.ErrorIsNil)
+	assertMembers(c, mems, []Member{{
+		Id:      1,
+		Address: s0.Addr(),
+		Tags:    initialTags,
+	}, {
+		Id:      2,
+		Address: s1.Addr(),
+		Tags:    map[string]string{"s1": "s1"},
+	}, {
+		Id:      3,
+		Address: s2.Addr(),
+		Tags:    map[string]string{"s2": "s2"},
+	}})
+	// find the current primary
+	initialPrimary := findPrimary(c, session)
+	c.Assert(initialPrimary, jc.GreaterThan, int(-1))
+	// ensure the secondaries are up and happy
+	// strategy = utils.AttemptStrategy{Total: time.Second, Delay: time.Millisecond * 50}
+	attemptLoop(c, strategy, "secondaries are ready", func() error {
+		status, err := CurrentStatus(session)
+		if err != nil {
+			return err
+		}
+		var notReady []string
+		for _, m := range status.Members {
+			if m.State != PrimaryState && m.State != SecondaryState {
+				notReady = append(notReady, fmt.Sprintf("Member{Id: %d, Address: %s, State: %s}", m.Id, m.Address, m.State.String()))
+			}
+		}
+		if len(notReady) > 0 {
+			return errors.Errorf("members not ready: %s", strings.Join(notReady, ", "))
+		}
+		return nil
+	})
+	// Now that the secondaries are up, we should be able to ask the primary to step down and notice that the primary changes
+	err = StepDownPrimary(session)
+	c.Assert(err, jc.ErrorIsNil)
+	// Changing the primary should cause us to get disconnected, so we need to reconnect
+	session.Close()
+	session = nil
+	attemptLoop(c, strategy, "reconnect", func() error {
+		session, err = s.root.Dial()
+		if err != nil {
+			session = nil
+			return err
+		}
+		return nil
+	})
+	// Now that we are reconnected, we should definitely have a different primary
+	newPrimary := findPrimary(c, session)
+	c.Check(newPrimary, gc.Not(gc.Equals), initialPrimary)
 }
 
 func ipv6GetAddr(inst *testing.MgoInstance) string {

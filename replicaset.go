@@ -421,6 +421,29 @@ type Config struct {
 	Members []Member `bson:"members"`
 }
 
+// StepDownPrimary asks the current mongo primary to step down.
+// Note that triggering a step down causes all client connections to be
+// disconnected. We explicitly treat the io.EOF we get as not being an error,
+// but all other sessions will also be disconnected.
+func StepDownPrimary(session *mgo.Session) error {
+	strictSession := session.Clone()
+	defer strictSession.Close()
+	// StepDown can only be called on the primary
+	session.SetMode(mgo.Primary, true)
+	// replSetStepDown takes a few optional parameters that vary based on what
+	// version of Mongo is running. In Mongo 2.4 it just takes the "step down
+	// seconds" which claims to default to 60s.
+	// In 3.2 it can also take secondaryCatchUpPeriodSecs which is supposed to
+	// start at 10s. However, testing shows that not passing either gives:
+	// err{"stepdown period must be longer than secondaryCatchUpPeriodSecs"}
+	err := session.Run(bson.D{{"replSetStepDown", 60.0}}, nil)
+	// we expect to get io.EOF so don't treat it as a failure.
+	if err == io.EOF {
+		return nil
+	}
+	return err
+}
+
 // CurrentStatus returns the status of the replica set for the given session.
 func CurrentStatus(session *mgo.Session) (*Status, error) {
 	status := &Status{}

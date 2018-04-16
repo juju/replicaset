@@ -425,22 +425,21 @@ type Config struct {
 // Note that triggering a step down causes all client connections to be
 // disconnected. We explicitly treat the io.EOF we get as not being an error,
 // but all other sessions will also be disconnected.
-func StepDownPrimary(session *mgo.Session) (error) {
-       strictSession := session.Clone()
-       defer strictSession.Close()
-       // StepDown can only be called on the primary
-       session.SetMode(mgo.Primary, true)
-       // replSetStepDown can take a number of arguments, such as "number of seconds to wait for a secondary to become
-       // up-to-date", "how long to force the current primary to not be primary", and "force" whether or not the primary
-       // should be demoted right now. But we just use the defaults for all of those.
-	   err := session.Run("replSetStepDown", nil)
-	   // we expect to get io.EOF so don't treat it as a failure.
-	   if err == io.EOF {
-		   return nil
-	   }
-	   return err
+func StepDownPrimary(session *mgo.Session) error {
+	strictSession := session.Clone()
+	defer strictSession.Close()
+	// StepDown can only be called on the primary
+	session.SetMode(mgo.Primary, true)
+	// replSetStepDown can take a number of arguments, such as "number of seconds to wait for a secondary to become
+	// up-to-date", "how long to force the current primary to not be primary", and "force" whether or not the primary
+	// should be demoted right now. But we just use the defaults for all of those.
+	err := session.Run("replSetStepDown", nil)
+	// we expect to get io.EOF so don't treat it as a failure.
+	if err == io.EOF {
+		return nil
+	}
+	return err
 }
-
 
 // CurrentStatus returns the status of the replica set for the given session.
 func CurrentStatus(session *mgo.Session) (*Status, error) {

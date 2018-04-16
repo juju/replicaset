@@ -635,14 +635,14 @@ func (s *MongoSuite) TestStepDownPrimary(c *gc.C) {
 	mems, err := CurrentMembers(session)
 	c.Assert(err, jc.ErrorIsNil)
 	assertMembers(c, mems, []Member{{
-		Id: 1,
+		Id:      1,
 		Address: s0.Addr(),
-		Tags: initialTags,
+		Tags:    initialTags,
 	}, {
-		Id: 2,
+		Id:      2,
 		Address: s1.Addr(),
 	}, {
-		Id: 3,
+		Id:      3,
 		Address: s2.Addr(),
 	}})
 	// find the current primary

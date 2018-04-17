@@ -8,6 +8,7 @@ package replicaset
 import (
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -157,12 +158,33 @@ type Member struct {
 
 func fmtConfigForLog(config *Config) string {
 	memberInfo := make([]string, len(config.Members))
-	for i, member := range config.Members {
-		memberInfo[i] = fmt.Sprintf("Member{%d %q %v}", member.Id, member.Address, member.Tags)
 
+	byId := make(map[int]Member, len(config.Members))
+	ids := make([]int, len(config.Members))
+	for i, member := range config.Members {
+		ids[i] = member.Id
+		byId[member.Id] = member
 	}
-	return fmt.Sprintf("{Name: %s, Version: %d, Members: {%s}}",
-		config.Name, config.Version, strings.Join(memberInfo, ", "))
+	sort.Ints(ids)
+	for i, id := range ids {
+		member := byId[id]
+		voting := "not-voting"
+		if member.Votes == nil || *member.Votes > 0 {
+			voting = "voting"
+		}
+		var tags []string
+		for key, val := range member.Tags {
+			tags = append(tags, fmt.Sprintf("%s:%s", key, val))
+		}
+		memberInfo[i] = fmt.Sprintf("    {%d %q %v %s},", member.Id, member.Address, strings.Join(tags, ", "), voting)
+	}
+	return fmt.Sprintf(`{
+  Name: %s,
+  Version: %d,
+  Members: {
+%s
+  },
+}`, config.Name, config.Version, strings.Join(memberInfo, "\n"))
 }
 
 // applyReplSetConfig applies the new config to the mongo session. It also logs

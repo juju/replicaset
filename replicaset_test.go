@@ -725,3 +725,44 @@ func (s *MongoIPV6Suite) TestAddressFixing(c *gc.C) {
 	c.Check(result.PrimaryAddress, gc.Equals, ipv6GetAddr(root))
 	c.Check(result.Addresses, jc.DeepEquals, []string{ipv6GetAddr(root)})
 }
+
+type fmtConfigForLogSuite struct {
+	testing.IsolationSuite
+}
+
+var _ = gc.Suite(&fmtConfigForLogSuite{})
+
+func (s *fmtConfigForLogSuite) TestSimpleFormatting(c *gc.C) {
+	anInt := func(v int) *int {
+		return &v
+	}
+	cfg := &Config{
+		Name: "juju",
+		Version: 1,
+		Members: []Member{{
+			Id: 2,
+			Address: "192.168.0.10:37017",
+			Tags: map[string]string{"juju-machine-id": "1"},
+			Votes: anInt(1),
+		}, {
+			Id: 1,
+			Address: "192.168.0.9:37017",
+			Tags: map[string]string{"juju-machine-id": "0"},
+			Votes: nil,
+		}, {
+			Id: 3,
+			Address: "192.168.0.27:37017",
+			Tags: map[string]string{"juju-machine-id": "2"},
+			Votes: anInt(0),
+		}},
+	}
+	c.Check(fmtConfigForLog(cfg), gc.Equals, `{
+  Name: juju,
+  Version: 1,
+  Members: {
+    {1 "192.168.0.9:37017" juju-machine-id:0 voting},
+    {2 "192.168.0.10:37017" juju-machine-id:1 voting},
+    {3 "192.168.0.27:37017" juju-machine-id:2 not-voting},
+  },
+}`)
+}

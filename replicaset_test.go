@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"sort"
 	"strings"
 	stdtesting "testing"
 	"time"
@@ -67,10 +68,13 @@ func assertMembers(c *gc.C, mems []Member, expectedMembers []Member) {
 	// 2.x and 3.2 seem to use different default values for bool. For
 	// example, in 3.2 false is false, not nil, and we can't know the
 	// pointer value to check with DeepEquals.
+	c.Logf("comparing: %s\nto: %s",
+		fmtConfigForLog(&Config{Name: "obtained", Members: mems[:]}),
+		fmtConfigForLog(&Config{Name: "expected", Members: expectedMembers[:]}))
 	for i, _ := range mems {
-		c.Assert(mems[i].Id, gc.Equals, expectedMembers[i].Id)
-		c.Assert(mems[i].Address, gc.Equals, expectedMembers[i].Address)
-		c.Assert(mems[i].Tags, jc.DeepEquals, expectedMembers[i].Tags)
+		c.Check(mems[i].Id, gc.Equals, expectedMembers[i].Id)
+		c.Check(mems[i].Address, gc.Equals, expectedMembers[i].Address)
+		c.Check(mems[i].Tags, jc.DeepEquals, expectedMembers[i].Tags)
 	}
 }
 
@@ -281,6 +285,8 @@ func assertAddRemoveSet(c *gc.C, root *testing.MgoInstance, getAddr func(*testin
 	expectedMembers = []Member{members[3], expectedMembers[2], expectedMembers[0], members[4]}
 	expectedMembers[0].Id = 11
 	expectedMembers[3].Id = 10
+	// CurrentMembers always sorts the member ids by Id so they can be nicely displayed and tracked.
+	sort.Slice(expectedMembers, func(i, j int) bool { return expectedMembers[i].Id < expectedMembers[j].Id })
 
 	attemptLoop(c, strategy, "CurrentMembers()", func() error {
 		var err error
@@ -724,4 +730,65 @@ func (s *MongoIPV6Suite) TestAddressFixing(c *gc.C) {
 	c.Check(result.Address, gc.Equals, ipv6GetAddr(root))
 	c.Check(result.PrimaryAddress, gc.Equals, ipv6GetAddr(root))
 	c.Check(result.Addresses, jc.DeepEquals, []string{ipv6GetAddr(root)})
+}
+
+type fmtConfigForLogSuite struct {
+	testing.IsolationSuite
+}
+
+var _ = gc.Suite(&fmtConfigForLogSuite{})
+
+func (s *fmtConfigForLogSuite) TestSimpleFormatting(c *gc.C) {
+	anInt := func(v int) *int {
+		return &v
+	}
+	cfg := &Config{
+		Name:    "juju",
+		Version: 1,
+		Members: []Member{{
+			Id:      2,
+			Address: "192.168.0.10:37017",
+			Tags:    map[string]string{"juju-machine-id": "1"},
+			Votes:   anInt(1),
+		}, {
+			Id:      1,
+			Address: "192.168.0.9:37017",
+			Tags:    map[string]string{"juju-machine-id": "0"},
+			Votes:   nil,
+		}, {
+			Id:      3,
+			Address: "192.168.0.27:37017",
+			Tags:    map[string]string{"juju-machine-id": "2"},
+			Votes:   anInt(0),
+		}},
+	}
+	c.Check(fmtConfigForLog(cfg), gc.Equals, `{
+  Name: juju,
+  Version: 1,
+  Members: {
+    {1 "192.168.0.9:37017" juju-machine-id:0 voting},
+    {2 "192.168.0.10:37017" juju-machine-id:1 voting},
+    {3 "192.168.0.27:37017" juju-machine-id:2 not-voting},
+  },
+}`)
+	// no side effect, the config is not sorted:
+	c.Check(cfg.Members[0].Id, gc.Equals, 2)
+	c.Check(cfg.Members[1].Id, gc.Equals, 1)
+	c.Check(cfg.Members[2].Id, gc.Equals, 3)
+	cfg2 := &Config{
+		Name:    "juju",
+		Version: 2,
+		Members: append([]Member(nil), cfg.Members...),
+	}
+	cfg2.Members[1].Votes = anInt(0)
+	cfg2.Members[2].Votes = anInt(1)
+	c.Check(fmtConfigForLog(cfg2), gc.Equals, `{
+  Name: juju,
+  Version: 2,
+  Members: {
+    {1 "192.168.0.9:37017" juju-machine-id:0 not-voting},
+    {2 "192.168.0.10:37017" juju-machine-id:1 voting},
+    {3 "192.168.0.27:37017" juju-machine-id:2 voting},
+  },
+}`)
 }

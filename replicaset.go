@@ -8,6 +8,7 @@ package replicaset
 import (
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -52,7 +53,7 @@ var (
 func attemptInitiate(monotonicSession *mgo.Session, cfg []Config) error {
 	var err error
 	for _, c := range cfg {
-		logger.Infof("Initiating replicaset with config %#v", c)
+		logger.Infof("Initiating replicaset with config: %s", fmtConfigForLog(&c))
 		if err = monotonicSession.Run(bson.D{{"replSetInitiate", c}}, nil); err != nil {
 			logger.Infof("Unsuccessful attempt to initiate replicaset: %v", err)
 			continue
@@ -155,14 +156,30 @@ type Member struct {
 	Votes *int `bson:"votes,omitempty"`
 }
 
+// fmtConfigForLog generates a succinct string suitable for debugging what the Members are up to.
+// Note that Members will be printed in Id sorted order, regardless of the order in config.Members
 func fmtConfigForLog(config *Config) string {
 	memberInfo := make([]string, len(config.Members))
-	for i, member := range config.Members {
-		memberInfo[i] = fmt.Sprintf("Member{%d %q %v}", member.Id, member.Address, member.Tags)
-
+	members := append([]Member(nil), config.Members...)
+	sort.SliceStable(members, func(i, j int) bool { return members[i].Id < members[j].Id })
+	for i, member := range members {
+		voting := "not-voting"
+		if member.Votes == nil || *member.Votes > 0 {
+			voting = "voting"
+		}
+		var tags []string
+		for key, val := range member.Tags {
+			tags = append(tags, fmt.Sprintf("%s:%s", key, val))
+		}
+		memberInfo[i] = fmt.Sprintf("    {%d %q %v %s},", member.Id, member.Address, strings.Join(tags, ", "), voting)
 	}
-	return fmt.Sprintf("{Name: %s, Version: %d, Members: {%s}}",
-		config.Name, config.Version, strings.Join(memberInfo, ", "))
+	return fmt.Sprintf(`{
+  Name: %s,
+  Version: %d,
+  Members: {
+%s
+  },
+}`, config.Name, config.Version, strings.Join(memberInfo, "\n"))
 }
 
 // applyReplSetConfig applies the new config to the mongo session. It also logs
@@ -170,7 +187,7 @@ func fmtConfigForLog(config *Config) string {
 // connection to be dropped. If so, it Refreshes the session and tries to Ping
 // again.
 func applyReplSetConfig(cmd string, session *mgo.Session, oldconfig, newconfig *Config) error {
-	logger.Debugf("%s() changing replica set\nfrom %s\n  to %s",
+	logger.Debugf("%s() changing replica set\nfrom %s\nto %s",
 		cmd, fmtConfigForLog(oldconfig), fmtConfigForLog(newconfig))
 
 	buildInfo, err := session.BuildInfo()
@@ -222,12 +239,7 @@ func Add(session *mgo.Session, members ...Member) error {
 
 	oldconfig := *config
 	config.Version++
-	max := 0
-	for _, member := range config.Members {
-		if member.Id > max {
-			max = member.Id
-		}
-	}
+	max := findMaxId(config.Members, members)
 
 outerLoop:
 	for _, newMember := range members {
@@ -267,6 +279,23 @@ func Remove(session *mgo.Session, addrs ...string) error {
 	return applyReplSetConfig("Remove", session, &oldconfig, config)
 }
 
+// findMaxId looks through both sets of members and makes sure we cannot reuse an Id value
+func findMaxId(oldMembers, newMembers []Member) int {
+	max := 0
+	for _, m := range oldMembers {
+		if m.Id > max {
+			max = m.Id
+		}
+	}
+	// Also check if any of the members being passed in already have an Id that we would be reusing.
+	for _, m := range newMembers {
+		if m.Id > max {
+			max = m.Id
+		}
+	}
+	return max
+}
+
 // Set changes the current set of replica set members.  Members will have their
 // ids set automatically if their ids are not already > 0.
 func Set(session *mgo.Session, members []Member) error {
@@ -282,20 +311,10 @@ func Set(session *mgo.Session, members []Member) error {
 	// Assign ids to members that did not previously exist, starting above the
 	// value of the highest id that already existed
 	ids := map[string]int{}
-	max := 0
+	max := findMaxId(config.Members, members)
 	for _, m := range config.Members {
 		ids[m.Address] = m.Id
-		if m.Id > max {
-			max = m.Id
-		}
 	}
-	// Also check if any of the members being passed in already have an Id that we would be reusing.
-	for _, m := range members {
-		if m.Id > max {
-			max = m.Id
-		}
-	}
-
 	for x, m := range members {
 		if id, ok := ids[m.Address]; ok {
 			m.Id = id
@@ -306,6 +325,8 @@ func Set(session *mgo.Session, members []Member) error {
 		members[x] = m
 	}
 
+	// Sort by Id just to keep things nicely understandable
+	sort.SliceStable(members, func(i, j int) bool { return members[i].Id < members[j].Id })
 	config.Members = members
 
 	return applyReplSetConfig("Set", session, &oldconfig, config)
@@ -391,6 +412,8 @@ func currentConfig(session *mgo.Session) (*Config, error) {
 		member.Address = formatIPv6AddressWithBrackets(member.Address)
 		members[index] = member
 	}
+	// Sort the values by Member.Id
+	sort.Slice(members, func(i, j int) bool { return members[i].Id < members[j].Id })
 	cfg.Members = members
 	return cfg, nil
 }

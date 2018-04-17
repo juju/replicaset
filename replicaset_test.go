@@ -771,16 +771,16 @@ func (s *fmtConfigForLogSuite) TestSimpleFormatting(c *gc.C) {
     {3 "192.168.0.27:37017" juju-machine-id:2 not-voting},
   },
 }`)
-	// Side effect, the config is sorted:
-	c.Check(cfg.Members[0].Id, gc.Equals, 1)
-	c.Check(cfg.Members[1].Id, gc.Equals, 2)
+	// no side effect, the config is not sorted:
+	c.Check(cfg.Members[0].Id, gc.Equals, 2)
+	c.Check(cfg.Members[1].Id, gc.Equals, 1)
 	c.Check(cfg.Members[2].Id, gc.Equals, 3)
 	cfg2 := &Config{
 		Name:    "juju",
 		Version: 2,
 		Members: append([]Member(nil), cfg.Members...),
 	}
-	cfg2.Members[0].Votes = anInt(0)
+	cfg2.Members[1].Votes = anInt(0)
 	cfg2.Members[2].Votes = anInt(1)
 	c.Check(fmtConfigForLog(cfg2), gc.Equals, `{
   Name: juju,

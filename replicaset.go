@@ -16,6 +16,7 @@ import (
 	"github.com/juju/errors"
 	"github.com/juju/loggo"
 	"github.com/juju/utils"
+	"github.com/kr/pretty"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 )
@@ -156,18 +157,12 @@ type Member struct {
 	Votes *int `bson:"votes,omitempty"`
 }
 
+// fmtConfigForLog generates a succinct string suitable for debugging what the Members are up to.
+// Note that as a side effect of calling fmtConfigForLog, the Members array will be sorted by Id.
 func fmtConfigForLog(config *Config) string {
 	memberInfo := make([]string, len(config.Members))
-
-	byId := make(map[int]Member, len(config.Members))
-	ids := make([]int, len(config.Members))
+	sort.SliceStable(config.Members, func(i, j int) bool { return config.Members[i].Id < config.Members[j].Id })
 	for i, member := range config.Members {
-		ids[i] = member.Id
-		byId[member.Id] = member
-	}
-	sort.Ints(ids)
-	for i, id := range ids {
-		member := byId[id]
 		voting := "not-voting"
 		if member.Votes == nil || *member.Votes > 0 {
 			voting = "voting"
@@ -192,8 +187,9 @@ func fmtConfigForLog(config *Config) string {
 // connection to be dropped. If so, it Refreshes the session and tries to Ping
 // again.
 func applyReplSetConfig(cmd string, session *mgo.Session, oldconfig, newconfig *Config) error {
-	logger.Debugf("%s() changing replica set\nfrom %s\n  to %s",
-		cmd, fmtConfigForLog(oldconfig), fmtConfigForLog(newconfig))
+	logger.Debugf("%s() changing replica set\nfrom %s\n  to %s\ndiff:\n%s",
+		cmd, fmtConfigForLog(oldconfig), fmtConfigForLog(newconfig),
+		strings.Join(pretty.Diff(oldconfig, newconfig), "\n"))
 
 	buildInfo, err := session.BuildInfo()
 	if err != nil {
@@ -413,6 +409,8 @@ func currentConfig(session *mgo.Session) (*Config, error) {
 		member.Address = formatIPv6AddressWithBrackets(member.Address)
 		members[index] = member
 	}
+	// Sort the values by Member.Id
+	sort.Slice(members, func(i, j int) bool { return members[i].Id < members[j].Id })
 	cfg.Members = members
 	return cfg, nil
 }

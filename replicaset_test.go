@@ -15,6 +15,7 @@ import (
 	"github.com/juju/testing"
 	jc "github.com/juju/testing/checkers"
 	"github.com/juju/utils"
+	"github.com/kr/pretty"
 	gc "gopkg.in/check.v1"
 	"gopkg.in/mgo.v2"
 )
@@ -737,23 +738,23 @@ func (s *fmtConfigForLogSuite) TestSimpleFormatting(c *gc.C) {
 		return &v
 	}
 	cfg := &Config{
-		Name: "juju",
+		Name:    "juju",
 		Version: 1,
 		Members: []Member{{
-			Id: 2,
+			Id:      2,
 			Address: "192.168.0.10:37017",
-			Tags: map[string]string{"juju-machine-id": "1"},
-			Votes: anInt(1),
+			Tags:    map[string]string{"juju-machine-id": "1"},
+			Votes:   anInt(1),
 		}, {
-			Id: 1,
+			Id:      1,
 			Address: "192.168.0.9:37017",
-			Tags: map[string]string{"juju-machine-id": "0"},
-			Votes: nil,
+			Tags:    map[string]string{"juju-machine-id": "0"},
+			Votes:   nil,
 		}, {
-			Id: 3,
+			Id:      3,
 			Address: "192.168.0.27:37017",
-			Tags: map[string]string{"juju-machine-id": "2"},
-			Votes: anInt(0),
+			Tags:    map[string]string{"juju-machine-id": "2"},
+			Votes:   anInt(0),
 		}},
 	}
 	c.Check(fmtConfigForLog(cfg), gc.Equals, `{
@@ -765,4 +766,28 @@ func (s *fmtConfigForLogSuite) TestSimpleFormatting(c *gc.C) {
     {3 "192.168.0.27:37017" juju-machine-id:2 not-voting},
   },
 }`)
+	// Side effect, the config is sorted:
+	c.Check(cfg.Members[0].Id, gc.Equals, 1)
+	c.Check(cfg.Members[1].Id, gc.Equals, 2)
+	c.Check(cfg.Members[2].Id, gc.Equals, 3)
+	cfg2 := &Config{
+		Name:    "juju",
+		Version: 2,
+		Members: append([]Member(nil), cfg.Members...),
+	}
+	cfg2.Members[0].Votes = anInt(0)
+	cfg2.Members[2].Votes = anInt(1)
+	c.Check(fmtConfigForLog(cfg2), gc.Equals, `{
+  Name: juju,
+  Version: 2,
+  Members: {
+    {1 "192.168.0.9:37017" juju-machine-id:0 not-voting},
+    {2 "192.168.0.10:37017" juju-machine-id:1 voting},
+    {3 "192.168.0.27:37017" juju-machine-id:2 voting},
+  },
+}`)
+	out := pretty.Diff(cfg, cfg2)
+	c.Check(strings.Join(out, "\n"), gc.Equals, `Version: 1 != 2
+Members[0].Votes: nil != &int(0)
+Members[2].Votes: 0 != 1`)
 }

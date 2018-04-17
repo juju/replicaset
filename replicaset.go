@@ -16,7 +16,6 @@ import (
 	"github.com/juju/errors"
 	"github.com/juju/loggo"
 	"github.com/juju/utils"
-	"github.com/kr/pretty"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 )
@@ -54,7 +53,7 @@ var (
 func attemptInitiate(monotonicSession *mgo.Session, cfg []Config) error {
 	var err error
 	for _, c := range cfg {
-		logger.Infof("Initiating replicaset with config %#v", c)
+		logger.Infof("Initiating replicaset with config: %s", fmtConfigForLog(&c))
 		if err = monotonicSession.Run(bson.D{{"replSetInitiate", c}}, nil); err != nil {
 			logger.Infof("Unsuccessful attempt to initiate replicaset: %v", err)
 			continue
@@ -187,9 +186,8 @@ func fmtConfigForLog(config *Config) string {
 // connection to be dropped. If so, it Refreshes the session and tries to Ping
 // again.
 func applyReplSetConfig(cmd string, session *mgo.Session, oldconfig, newconfig *Config) error {
-	logger.Debugf("%s() changing replica set\nfrom %s\n  to %s\ndiff:\n%s",
-		cmd, fmtConfigForLog(oldconfig), fmtConfigForLog(newconfig),
-		strings.Join(pretty.Diff(oldconfig, newconfig), "\n"))
+	logger.Debugf("%s() changing replica set\nfrom %s\n  to %s",
+		cmd, fmtConfigForLog(oldconfig), fmtConfigForLog(newconfig))
 
 	buildInfo, err := session.BuildInfo()
 	if err != nil {

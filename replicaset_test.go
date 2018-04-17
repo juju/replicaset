@@ -15,7 +15,6 @@ import (
 	"github.com/juju/testing"
 	jc "github.com/juju/testing/checkers"
 	"github.com/juju/utils"
-	"github.com/kr/pretty"
 	gc "gopkg.in/check.v1"
 	"gopkg.in/mgo.v2"
 )
@@ -786,8 +785,4 @@ func (s *fmtConfigForLogSuite) TestSimpleFormatting(c *gc.C) {
     {3 "192.168.0.27:37017" juju-machine-id:2 voting},
   },
 }`)
-	out := pretty.Diff(cfg, cfg2)
-	c.Check(strings.Join(out, "\n"), gc.Equals, `Version: 1 != 2
-Members[0].Votes: nil != &int(0)
-Members[2].Votes: 0 != 1`)
 }

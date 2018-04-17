@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"sort"
 	"strings"
 	stdtesting "testing"
 	"time"
@@ -67,10 +68,13 @@ func assertMembers(c *gc.C, mems []Member, expectedMembers []Member) {
 	// 2.x and 3.2 seem to use different default values for bool. For
 	// example, in 3.2 false is false, not nil, and we can't know the
 	// pointer value to check with DeepEquals.
+	c.Logf("comparing: %s\nto: %s",
+		fmtConfigForLog(&Config{Name: "obtained", Members: mems[:]}),
+		fmtConfigForLog(&Config{Name: "expected", Members: expectedMembers[:]}))
 	for i, _ := range mems {
-		c.Assert(mems[i].Id, gc.Equals, expectedMembers[i].Id)
-		c.Assert(mems[i].Address, gc.Equals, expectedMembers[i].Address)
-		c.Assert(mems[i].Tags, jc.DeepEquals, expectedMembers[i].Tags)
+		c.Check(mems[i].Id, gc.Equals, expectedMembers[i].Id)
+		c.Check(mems[i].Address, gc.Equals, expectedMembers[i].Address)
+		c.Check(mems[i].Tags, jc.DeepEquals, expectedMembers[i].Tags)
 	}
 }
 
@@ -281,6 +285,8 @@ func assertAddRemoveSet(c *gc.C, root *testing.MgoInstance, getAddr func(*testin
 	expectedMembers = []Member{members[3], expectedMembers[2], expectedMembers[0], members[4]}
 	expectedMembers[0].Id = 11
 	expectedMembers[3].Id = 10
+	// CurrentMembers always sorts the member ids by Id so they can be nicely displayed and tracked.
+	sort.Slice(expectedMembers, func(i, j int) bool { return expectedMembers[i].Id < expectedMembers[j].Id })
 
 	attemptLoop(c, strategy, "CurrentMembers()", func() error {
 		var err error

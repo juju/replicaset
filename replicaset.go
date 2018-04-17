@@ -186,7 +186,7 @@ func fmtConfigForLog(config *Config) string {
 // connection to be dropped. If so, it Refreshes the session and tries to Ping
 // again.
 func applyReplSetConfig(cmd string, session *mgo.Session, oldconfig, newconfig *Config) error {
-	logger.Debugf("%s() changing replica set\nfrom %s\n  to %s",
+	logger.Debugf("%s() changing replica set\nfrom %s\nto %s",
 		cmd, fmtConfigForLog(oldconfig), fmtConfigForLog(newconfig))
 
 	buildInfo, err := session.BuildInfo()

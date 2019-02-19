@@ -143,6 +143,19 @@ type Member struct {
 	// in the form hostname:port.
 	Address string `bson:"host"`
 
+	// Arbiter holds whether the member is an arbiter only.
+	// This value is optional; it defaults to false.
+	Arbiter *bool `bson:"arbiterOnly,omitempty"`
+
+	// BuildIndexes determines whether the mongod builds indexes on this member.
+	// This value is optional; it defaults to true.
+	BuildIndexes *bool `bson:"buildIndexes,omitempty"`
+
+	// Hidden determines whether the replica set hides this member from
+	// the output of IsMaster.
+	// This value is optional; it defaults to false.
+	Hidden *bool `bson:"hidden,omitempty"`
+
 	// Priority determines eligibility of a member to become primary.
 	// This value is optional; it defaults to 1.
 	Priority *float64 `bson:"priority,omitempty"`
@@ -150,6 +163,11 @@ type Member struct {
 	// Tags store additional information about a replica member, often used for
 	// customizing read preferences and write concern.
 	Tags map[string]string `bson:"tags,omitempty"`
+
+	// SlaveDelay describes the number of seconds behind the master that this
+	// replica set member should lag rounded up to the nearest second.
+	// This value is optional; it defaults to 0.
+	SlaveDelay *time.Duration `bson:"slaveDelay,omitempty"`
 
 	// Votes controls the number of votes a server has in a replica set election.
 	// This value is optional; it defaults to 1.

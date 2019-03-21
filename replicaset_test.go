@@ -103,6 +103,45 @@ func dialAndTestInitiate(c *gc.C, inst *testing.MgoInstance, addr string) {
 	loadData(session, c)
 }
 
+func (s *MongoSuite) TestInitiateSetsProtocolVersion(c *gc.C) {
+	s.root.Destroy()
+
+	// create a new server that hasn't been initiated
+	s.root = newServer(c)
+	session := s.root.MustDialDirect()
+	defer session.Close()
+
+	mockBuildInfo := func(session *mgo.Session) (mgo.BuildInfo, error) {
+		return mgo.BuildInfo{
+			Version:      "4",
+			GitVersion:   "4.0.0",
+			VersionArray: []int{4, 0, 0},
+		}, nil
+	}
+	called := false
+	mockAttemptInitiate := func(monotonicSession *mgo.Session, cfg []Config) error {
+		c.Assert(cfg, gc.HasLen, 2)
+		if cfg[0].ProtocolVersion != 1 {
+			c.Fatalf("obtained protocol version %d, expected 1", cfg[0].ProtocolVersion)
+		}
+		called = true
+		return nil
+	}
+	mockCurentStatus := func(session *mgo.Session) (*Status, error) {
+		return &Status{
+			Name:    "test",
+			Members: []MemberStatus{{}},
+		}, nil
+	}
+
+	s.PatchValue(&getBuildInfo, mockBuildInfo)
+	s.PatchValue(&attemptInitiate, mockAttemptInitiate)
+	s.PatchValue(&getCurrentStatus, mockCurentStatus)
+	err := Initiate(session, s.root.Addr(), rsName, initialTags)
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(called, jc.IsTrue)
+}
+
 func (s *MongoSuite) TestInitiateWaitsForStatus(c *gc.C) {
 	s.root.Destroy()
 
@@ -765,6 +804,7 @@ func (s *fmtConfigForLogSuite) TestSimpleFormatting(c *gc.C) {
 	c.Check(fmtConfigForLog(cfg), gc.Equals, `{
   Name: juju,
   Version: 1,
+  Protocol Version: 0,
   Members: {
     {1 "192.168.0.9:37017" juju-machine-id:0 voting},
     {2 "192.168.0.10:37017" juju-machine-id:1 voting},
@@ -776,15 +816,17 @@ func (s *fmtConfigForLogSuite) TestSimpleFormatting(c *gc.C) {
 	c.Check(cfg.Members[1].Id, gc.Equals, 1)
 	c.Check(cfg.Members[2].Id, gc.Equals, 3)
 	cfg2 := &Config{
-		Name:    "juju",
-		Version: 2,
-		Members: append([]Member(nil), cfg.Members...),
+		Name:            "juju",
+		Version:         2,
+		ProtocolVersion: 1,
+		Members:         append([]Member(nil), cfg.Members...),
 	}
 	cfg2.Members[1].Votes = anInt(0)
 	cfg2.Members[2].Votes = anInt(1)
 	c.Check(fmtConfigForLog(cfg2), gc.Equals, `{
   Name: juju,
   Version: 2,
+  Protocol Version: 1,
   Members: {
     {1 "192.168.0.9:37017" juju-machine-id:0 not-voting},
     {2 "192.168.0.10:37017" juju-machine-id:1 voting},

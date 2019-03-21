@@ -45,12 +45,14 @@ var logger = loggo.GetLogger("juju.replicaset")
 
 var (
 	getCurrentStatus = CurrentStatus
+	getBuildInfo     = BuildInfo
 	isReady          = IsReady
+	attemptInitiate  = doAttemptInitiate
 )
 
-// attemptInitiate will attempt to initiate a mongodb replicaset with each of
+// doAttemptInitiate will attempt to initiate a mongodb replicaset with each of
 // the given configs, returning as soon as one config is successful.
-func attemptInitiate(monotonicSession *mgo.Session, cfg []Config) error {
+func doAttemptInitiate(monotonicSession *mgo.Session, cfg []Config) error {
 	var err error
 	for _, c := range cfg {
 		logger.Infof("Initiating replicaset with config: %s", fmtConfigForLog(&c))
@@ -77,22 +79,34 @@ func Initiate(session *mgo.Session, address, name string, tags map[string]string
 	monotonicSession := session.Clone()
 	defer monotonicSession.Close()
 	monotonicSession.SetMode(mgo.Monotonic, true)
+
+	// For mongo 4 and above, we use protocol version 1.
+	buildInfo, err := getBuildInfo(monotonicSession)
+	if err != nil {
+		return err
+	}
+	protocolVersion := 0
+	if buildInfo.VersionAtLeast(4) {
+		protocolVersion = 1
+	}
+
 	// We don't know mongod's ability to use a correct IPv6 addr format
 	// until the server is started, but we need to know before we can start
 	// it. Try the older, incorrect format, if the correct format fails.
 	cfg := []Config{
-		Config{
-			Name:    name,
-			Version: 1,
+		{
+			Name:            name,
+			Version:         1,
+			ProtocolVersion: protocolVersion,
 			Members: []Member{{
 				Id:      1,
 				Address: address,
 				Tags:    tags,
 			}},
-		},
-		Config{
-			Name:    name,
-			Version: 1,
+		}, {
+			Name:            name,
+			Version:         1,
+			ProtocolVersion: protocolVersion,
 			Members: []Member{{
 				Id:      1,
 				Address: formatIPv6AddressWithoutBrackets(address),
@@ -101,7 +115,6 @@ func Initiate(session *mgo.Session, address, name string, tags map[string]string
 		},
 	}
 
-	var err error
 	// Attempt replSetInitiate, with potential retries.
 	for i := 0; i < maxInitiateAttempts; i++ {
 		monotonicSession.Refresh()
@@ -194,10 +207,11 @@ func fmtConfigForLog(config *Config) string {
 	return fmt.Sprintf(`{
   Name: %s,
   Version: %d,
+  Protocol Version: %d,
   Members: {
 %s
   },
-}`, config.Name, config.Version, strings.Join(memberInfo, "\n"))
+}`, config.Name, config.Version, config.ProtocolVersion, strings.Join(memberInfo, "\n"))
 }
 
 // applyReplSetConfig applies the new config to the mongo session. It also logs
@@ -208,7 +222,7 @@ func applyReplSetConfig(cmd string, session *mgo.Session, oldconfig, newconfig *
 	logger.Debugf("%s() changing replica set\nfrom %s\nto %s",
 		cmd, fmtConfigForLog(oldconfig), fmtConfigForLog(newconfig))
 
-	buildInfo, err := session.BuildInfo()
+	buildInfo, err := getBuildInfo(session)
 	if err != nil {
 		return err
 	}
@@ -439,9 +453,10 @@ func currentConfig(session *mgo.Session) (*Config, error) {
 // Config is the document stored in mongodb that defines the servers in the
 // replica set
 type Config struct {
-	Name    string   `bson:"_id"`
-	Version int      `bson:"version"`
-	Members []Member `bson:"members"`
+	Name            string   `bson:"_id"`
+	Version         int      `bson:"version"`
+	ProtocolVersion int      `bson:"protocolVersion,omitempty"`
+	Members         []Member `bson:"members"`
 }
 
 // StepDownPrimary asks the current mongo primary to step down.
@@ -465,6 +480,11 @@ func StepDownPrimary(session *mgo.Session) error {
 		return nil
 	}
 	return err
+}
+
+// BuildInfo returns the mongod build info for the given session.
+func BuildInfo(session *mgo.Session) (mgo.BuildInfo, error) {
+	return session.BuildInfo()
 }
 
 // CurrentStatus returns the status of the replica set for the given session.

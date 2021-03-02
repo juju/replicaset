@@ -13,11 +13,11 @@ import (
 	"time"
 
 	"github.com/juju/errors"
+	"github.com/juju/mgo/v2"
 	"github.com/juju/testing"
 	jc "github.com/juju/testing/checkers"
-	"github.com/juju/utils"
+	"github.com/juju/utils/v2"
 	gc "gopkg.in/check.v1"
-	"gopkg.in/mgo.v2"
 )
 
 const rsName = "juju"

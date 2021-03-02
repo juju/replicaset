@@ -15,9 +15,9 @@ import (
 
 	"github.com/juju/errors"
 	"github.com/juju/loggo"
-	"github.com/juju/utils"
-	"gopkg.in/mgo.v2"
-	"gopkg.in/mgo.v2/bson"
+	"github.com/juju/mgo/v2"
+	"github.com/juju/mgo/v2/bson"
+	"github.com/juju/utils/v2"
 )
 
 const (

@@ -224,6 +224,9 @@ func applyReplSetConfigChanges(cmd string, session *mgo.Session, currentConfig *
 	logger.Debugf("%s() changing replica set\n%s\n- added:\n%s\n- removed: %v",
 		cmd, fmtConfigForLog(currentConfig), fmtMembersForLog(added), removed)
 
+	if currentConfig == nil {
+		return errors.New("current config cannot be nil")
+	}
 	newConfig := *currentConfig
 	// Mongo 4.4 onwards requires we process one change at a time.
 	// First do the adds.

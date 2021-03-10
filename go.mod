@@ -1,4 +1,4 @@
-module github.com/juju/replicaset
+module github.com/juju/replicaset/v2
 
 go 1.14
 

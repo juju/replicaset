@@ -8,6 +8,7 @@ package replicaset
 import (
 	"fmt"
 	"io"
+	"regexp"
 	"sort"
 	"strings"
 	"syscall"
@@ -21,9 +22,6 @@ import (
 )
 
 const (
-	// MaxPeers defines the maximum number of peers that mongo supports.
-	MaxPeers = 7
-
 	// maxInitiateAttempts is the maximum number of times to attempt
 	// replSetInitiate for each call to Initiate.
 	maxInitiateAttempts = 10
@@ -187,11 +185,24 @@ type Member struct {
 	Votes *int `bson:"votes,omitempty"`
 }
 
-// fmtConfigForLog generates a succinct string suitable for debugging what the Members are up to.
-// Note that Members will be printed in Id sorted order, regardless of the order in config.Members
+// fmtConfigForLog generates a succinct string suitable for debugging.
 func fmtConfigForLog(config *Config) string {
-	memberInfo := make([]string, len(config.Members))
-	members := append([]Member(nil), config.Members...)
+	return fmt.Sprintf(`{
+  Name: %s,
+  Version: %d,
+  Term: %d,
+  Protocol Version: %d,
+  Members: {
+%s
+  },
+}`, config.Name, config.Version, config.Term, config.ProtocolVersion, fmtMembersForLog(config.Members))
+}
+
+// fmtMembersForLog generates a succinct string suitable for debugging what the Members are up to.
+// Note that Members will be printed in Id sorted order, regardless of the order in membersToLog.
+func fmtMembersForLog(membersToLog []Member) string {
+	memberInfo := make([]string, len(membersToLog))
+	members := append([]Member(nil), membersToLog...)
 	sort.SliceStable(members, func(i, j int) bool { return members[i].Id < members[j].Id })
 	for i, member := range members {
 		voting := "not-voting"
@@ -204,38 +215,55 @@ func fmtConfigForLog(config *Config) string {
 		}
 		memberInfo[i] = fmt.Sprintf("    {%d %q %v %s},", member.Id, member.Address, strings.Join(tags, ", "), voting)
 	}
-	return fmt.Sprintf(`{
-  Name: %s,
-  Version: %d,
-  Protocol Version: %d,
-  Members: {
-%s
-  },
-}`, config.Name, config.Version, config.ProtocolVersion, strings.Join(memberInfo, "\n"))
+	return strings.Join(memberInfo, "\n")
 }
 
-// applyReplSetConfig applies the new config to the mongo session. It also logs
-// what the changes are. It checks if the replica set changes cause the DB
-// connection to be dropped. If so, it Refreshes the session and tries to Ping
-// again.
-func applyReplSetConfig(cmd string, session *mgo.Session, oldconfig, newconfig *Config) error {
-	logger.Debugf("%s() changing replica set\nfrom %s\nto %s",
-		cmd, fmtConfigForLog(oldconfig), fmtConfigForLog(newconfig))
+// applyReplSetConfigChanges applies the specified changes to the mongo session.
+// It also logs what the changes are.
+func applyReplSetConfigChanges(cmd string, session *mgo.Session, currentConfig *Config, added []Member, removed []int) error {
+	logger.Debugf("%s() changing replica set\n%s\n- added:\n%s\n- removed: %v",
+		cmd, fmtConfigForLog(currentConfig), fmtMembersForLog(added), removed)
 
-	buildInfo, err := getBuildInfo(session)
-	if err != nil {
-		return err
-	}
-	// https://jira.mongodb.org/browse/SERVER-5436
-	if !buildInfo.VersionAtLeast(2, 7, 4) {
-		// newConfig here is internal and safe to mutate
-		for index, member := range newconfig.Members {
-			newconfig.Members[index].Address = formatIPv6AddressWithoutBrackets(member.Address)
-			logger.Debugf("replica set using IP addr %s",
-				newconfig.Members[index].Address)
+	newConfig := *currentConfig
+	// Mongo 4.4 onwards requires we process one change at a time.
+	// First do the adds.
+	for _, m := range added {
+		newConfig.Version++
+		newConfig.Members = append(newConfig.Members, m)
+		err := applyReplSetConfig(cmd, session, newConfig)
+		if err != nil {
+			return fmt.Errorf("cannot add member %#v to replicaset: %v", m, err)
 		}
 	}
-	err = session.Run(bson.D{{"replSetReconfig", newconfig}}, nil)
+
+	// Then do the removes.
+	for _, id := range removed {
+		haveChanges := false
+		for n, m := range newConfig.Members {
+			if m.Id != id {
+				continue
+			}
+			haveChanges = true
+			newConfig.Members = append(newConfig.Members[:n], newConfig.Members[n+1:]...)
+			break
+		}
+		if !haveChanges {
+			continue
+		}
+		newConfig.Version++
+		err := applyReplSetConfig(cmd, session, newConfig)
+		if err != nil {
+			return fmt.Errorf("cannot remove member %d from replicaset: %v", id, err)
+		}
+	}
+	return nil
+}
+
+// applyReplSetConfig applies the specified config to the mongo session.
+// It checks if the replica set changes cause the DB connection to be dropped.
+// If so, it Refreshes the session and tries to Ping again.
+func applyReplSetConfig(cmd string, session *mgo.Session, newConfig Config) error {
+	err := session.Run(bson.D{{"replSetReconfig", newConfig}}, nil)
 	if err == io.EOF {
 		// If the primary changes due to replSetReconfig, then all
 		// current connections are dropped.
@@ -259,6 +287,15 @@ func applyReplSetConfig(cmd string, session *mgo.Session, oldconfig, newconfig *
 	return err
 }
 
+var localHostIpv4 = regexp.MustCompile(`127\.0\.0\.\d+`)
+
+func isLocalhost(addr string) bool {
+	return addr == "::1" ||
+		addr == "0:0:0:0:0:0:0:1" ||
+		localHostIpv4.MatchString(addr) ||
+		addr == "localhost"
+}
+
 // Add adds the given members to the session's replica set.  Duplicates of
 // existing replicas will be ignored.
 //
@@ -269,14 +306,14 @@ func Add(session *mgo.Session, members ...Member) error {
 		return err
 	}
 
-	oldconfig := *config
-	config.Version++
 	max := findMaxId(config.Members, members)
 
+	var added []Member
 outerLoop:
 	for _, newMember := range members {
 		for _, member := range config.Members {
-			if member.Address == newMember.Address {
+			if member.Address == newMember.Address ||
+				isLocalhost(member.Address) && isLocalhost(newMember.Address) {
 				// already exists, skip it
 				continue outerLoop
 			}
@@ -286,9 +323,9 @@ outerLoop:
 			max++
 			newMember.Id = max
 		}
-		config.Members = append(config.Members, newMember)
+		added = append(added, newMember)
 	}
-	return applyReplSetConfig("Add", session, &oldconfig, config)
+	return applyReplSetConfigChanges("Add", session, config, added, nil)
 }
 
 // Remove removes members with the given addresses from the replica set. It is
@@ -298,17 +335,17 @@ func Remove(session *mgo.Session, addrs ...string) error {
 	if err != nil {
 		return err
 	}
-	oldconfig := *config
-	config.Version++
+	var toRemove []int
 	for _, rem := range addrs {
-		for n, repl := range config.Members {
-			if repl.Address == rem {
-				config.Members = append(config.Members[:n], config.Members[n+1:]...)
+		for _, repl := range config.Members {
+			if repl.Address == rem ||
+				isLocalhost(repl.Address) && isLocalhost(rem) {
+				toRemove = append(toRemove, repl.Id)
 				break
 			}
 		}
 	}
-	return applyReplSetConfig("Remove", session, &oldconfig, config)
+	return applyReplSetConfigChanges("Remove", session, config, nil, toRemove)
 }
 
 // findMaxId looks through both sets of members and makes sure we cannot reuse an Id value
@@ -336,35 +373,49 @@ func Set(session *mgo.Session, members []Member) error {
 		return err
 	}
 
-	// Copy the current configuration for logging
-	oldconfig := *config
-	config.Version++
-
-	// Assign ids to members that did not previously exist, starting above the
-	// value of the highest id that already existed
-	ids := map[string]int{}
+	// Assign existingIds to members that did not previously exist, starting above the
+	// value of the highest id that already existed.
+	existingIds := map[string]int{}
 	max := findMaxId(config.Members, members)
 	for _, m := range config.Members {
-		ids[m.Address] = m.Id
+		existingIds[m.Address] = m.Id
 	}
-	for x, m := range members {
-		if id, ok := ids[m.Address]; ok {
-			m.Id = id
-		} else if m.Id < 1 {
+
+	// Gather the wanted ids so we can see which ones have been removed.
+	wantIds := map[string]int{}
+	for _, m := range members {
+		wantIds[m.Address] = m.Id
+	}
+
+	// Compose the added members.
+	var added []Member
+	for _, m := range members {
+		_, ok := existingIds[m.Address]
+		if ok {
+			continue
+		}
+		if m.Id < 1 {
 			max++
 			m.Id = max
+			added = append(added, m)
 		}
-		members[x] = m
+		added = append(added, m)
 	}
 
-	// Sort by Id just to keep things nicely understandable
-	sort.SliceStable(members, func(i, j int) bool { return members[i].Id < members[j].Id })
-	config.Members = members
+	// Remove all the wanted addresses from the existing ones.
+	// Any remaining are those to be removed.
+	for addr := range wantIds {
+		delete(existingIds, addr)
+	}
+	var removed []int
+	for _, id := range existingIds {
+		removed = append(removed, id)
+	}
 
-	return applyReplSetConfig("Set", session, &oldconfig, config)
+	return applyReplSetConfigChanges("Set", session, config, added, removed)
 }
 
-// Config reports information about the configuration of a given mongo node
+// IsMasterResults holds information about the configuration of a given mongo node.
 type IsMasterResults struct {
 	// The following fields hold information about the specific mongodb node.
 	IsMaster  bool      `bson:"ismaster"`
@@ -447,6 +498,7 @@ func currentConfig(session *mgo.Session) (*Config, error) {
 	// Sort the values by Member.Id
 	sort.Slice(members, func(i, j int) bool { return members[i].Id < members[j].Id })
 	cfg.Members = members
+	logger.Debugf("current replicaset config: %s", fmtConfigForLog(cfg))
 	return cfg, nil
 }
 
@@ -455,6 +507,7 @@ func currentConfig(session *mgo.Session) (*Config, error) {
 type Config struct {
 	Name            string   `bson:"_id"`
 	Version         int      `bson:"version"`
+	Term            int      `bson:"term,omitempty"`
 	ProtocolVersion int      `bson:"protocolVersion,omitempty"`
 	Members         []Member `bson:"members"`
 }
@@ -510,7 +563,7 @@ type Status struct {
 	Members []MemberStatus `bson:"members"`
 }
 
-// Status holds the status of a replica set member returned from
+// MemberStatus holds the status of a replica set member returned from
 // replSetGetStatus.
 type MemberStatus struct {
 	// Id holds the replica set id of the member that the status is describing.

@@ -40,6 +40,7 @@ func newServer(c *gc.C) *testing.MgoInstance {
 	if err != nil {
 		inst.Destroy()
 		c.Fatalf("error dialing mongo server: %v", err.Error())
+		return nil
 	}
 	defer session.Close()
 
@@ -48,6 +49,11 @@ func newServer(c *gc.C) *testing.MgoInstance {
 		inst.Destroy()
 		c.Fatalf("error pinging mongo server: %v", err.Error())
 	}
+	buildInfo, err := session.BuildInfo()
+	c.Assert(err, jc.ErrorIsNil)
+	if !buildInfo.VersionAtLeast(4) {
+		c.Fatalf("only mongo version 4 or greater supported, found %v", buildInfo.Version)
+	}
 	return inst
 }
 
@@ -55,6 +61,7 @@ var _ = gc.Suite(&MongoSuite{})
 
 func (s *MongoSuite) SetUpTest(c *gc.C) {
 	s.IsolationSuite.SetUpTest(c)
+	s.PatchEnvironment("JUJU_MONGO_STORAGE_ENGINE", "wiredTiger")
 	s.root = newServer(c)
 	s.AddCleanup(func(c *gc.C) { s.root.Destroy() })
 	dialAndTestInitiate(c, s.root, s.root.Addr())
@@ -71,7 +78,7 @@ func assertMembers(c *gc.C, mems []Member, expectedMembers []Member) {
 	c.Logf("comparing: %s\nto: %s",
 		fmtConfigForLog(&Config{Name: "obtained", Members: mems[:]}),
 		fmtConfigForLog(&Config{Name: "expected", Members: expectedMembers[:]}))
-	for i, _ := range mems {
+	for i := range mems {
 		c.Check(mems[i].Id, gc.Equals, expectedMembers[i].Id)
 		c.Check(mems[i].Address, gc.Equals, expectedMembers[i].Address)
 		c.Check(mems[i].Tags, jc.DeepEquals, expectedMembers[i].Tags)
@@ -167,7 +174,8 @@ func (s *MongoSuite) TestInitiateWaitsForStatus(c *gc.C) {
 	}
 
 	s.PatchValue(&getCurrentStatus, mockStatus)
-	Initiate(session, s.root.Addr(), rsName, initialTags)
+	err := Initiate(session, s.root.Addr(), rsName, initialTags)
+	c.Assert(err, jc.ErrorIsNil)
 	c.Assert(i, gc.Equals, 21)
 }
 
@@ -275,8 +283,8 @@ func assertAddRemoveSet(c *gc.C, root *testing.MgoInstance, getAddr func(*testin
 		return err
 	})
 	c.Assert(cfg.Name, gc.Equals, rsName)
-	// 2 since we already changed it once
-	c.Assert(cfg.Version, gc.Equals, 2)
+	// 5 since it increments for each added/removed member.
+	c.Assert(cfg.Version, gc.Equals, 5)
 
 	mems := cfg.Members
 	assertMembers(c, mems, expectedMembers)
@@ -553,11 +561,11 @@ func (s *MongoSuite) TestCurrentStatus(c *gc.C) {
 
 	inst1 := newServer(c)
 	defer inst1.Destroy()
-	defer Remove(session, inst1.Addr())
+	defer func() { _ = Remove(session, inst1.Addr()) }()
 
 	inst2 := newServer(c)
 	defer inst2.Destroy()
-	defer Remove(session, inst2.Addr())
+	defer func() { _ = Remove(session, inst2.Addr()) }()
 
 	var err error
 	strategy := utils.AttemptStrategy{Total: time.Minute * 2, Delay: time.Millisecond * 500}
@@ -692,7 +700,7 @@ func (s *MongoSuite) TestStepDownPrimary(c *gc.C) {
 	}})
 	// find the current primary
 	initialPrimary := findPrimary(c, session)
-	c.Assert(initialPrimary, jc.GreaterThan, int(-1))
+	c.Assert(initialPrimary, jc.GreaterThan, -1)
 	// ensure the secondaries are up and happy
 	// strategy = utils.AttemptStrategy{Total: time.Second, Delay: time.Millisecond * 50}
 	attemptLoop(c, strategy, "secondaries are ready", func() error {
@@ -740,6 +748,11 @@ type MongoIPV6Suite struct {
 
 var _ = gc.Suite(&MongoIPV6Suite{})
 
+func (s *MongoIPV6Suite) SetUpTest(c *gc.C) {
+	s.IsolationSuite.SetUpTest(c)
+	s.PatchEnvironment("JUJU_MONGO_STORAGE_ENGINE", "wiredTiger")
+}
+
 func (s *MongoIPV6Suite) TestAddRemoveSetIPv6(c *gc.C) {
 	root := newServer(c)
 	defer root.Destroy()
@@ -784,6 +797,7 @@ func (s *fmtConfigForLogSuite) TestSimpleFormatting(c *gc.C) {
 	cfg := &Config{
 		Name:    "juju",
 		Version: 1,
+		Term:    1,
 		Members: []Member{{
 			Id:      2,
 			Address: "192.168.0.10:37017",
@@ -804,6 +818,7 @@ func (s *fmtConfigForLogSuite) TestSimpleFormatting(c *gc.C) {
 	c.Check(fmtConfigForLog(cfg), gc.Equals, `{
   Name: juju,
   Version: 1,
+  Term: 1,
   Protocol Version: 0,
   Members: {
     {1 "192.168.0.9:37017" juju-machine-id:0 voting},
@@ -818,6 +833,7 @@ func (s *fmtConfigForLogSuite) TestSimpleFormatting(c *gc.C) {
 	cfg2 := &Config{
 		Name:            "juju",
 		Version:         2,
+		Term:            1,
 		ProtocolVersion: 1,
 		Members:         append([]Member(nil), cfg.Members...),
 	}
@@ -826,6 +842,7 @@ func (s *fmtConfigForLogSuite) TestSimpleFormatting(c *gc.C) {
 	c.Check(fmtConfigForLog(cfg2), gc.Equals, `{
   Name: juju,
   Version: 2,
+  Term: 1,
   Protocol Version: 1,
   Members: {
     {1 "192.168.0.9:37017" juju-machine-id:0 not-voting},

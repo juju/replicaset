@@ -218,18 +218,58 @@ func fmtMembersForLog(membersToLog []Member) string {
 	return strings.Join(memberInfo, "\n")
 }
 
+// fmtUpdatedMembersForLog generates a succinct string suitable for debugging what the Members are up to.
+// Note that Members will be printed in Id sorted order, regardless of the order in membersToLog.
+func fmtUpdatedMembersForLog(membersToLog []updatedMember) string {
+	memberInfo := make([]string, len(membersToLog))
+	members := append([]updatedMember(nil), membersToLog...)
+	sort.SliceStable(members, func(i, j int) bool { return members[i].Id < members[j].Id })
+	for i, member := range members {
+		voting := "not-voting"
+		if member.Votes == nil || *member.Votes > 0 {
+			voting = "voting"
+		}
+		var tags []string
+		for key, val := range member.Tags {
+			tags = append(tags, fmt.Sprintf("%s:%s", key, val))
+		}
+		memberInfo[i] = fmt.Sprintf("    {%d (was %d) %q %v %s},", member.Id, member.oldId, member.Address, strings.Join(tags, ", "), voting)
+	}
+	return strings.Join(memberInfo, "\n")
+}
+
 // applyReplSetConfigChanges applies the specified changes to the mongo session.
 // It also logs what the changes are.
-func applyReplSetConfigChanges(cmd string, session *mgo.Session, currentConfig *Config, added []Member, removed []int) error {
-	logger.Debugf("%s() changing replica set\n%s\n- added:\n%s\n- removed: %v",
-		cmd, fmtConfigForLog(currentConfig), fmtMembersForLog(added), removed)
+func applyReplSetConfigChanges(cmd string, session mgoSession, currentConfig *Config, updated []updatedMember, added []Member, removed []int) error {
+	logger.Debugf("%s() changing replica set\n%s\n- updated:\n%#v\n- added:\n%s\n- removed: %v",
+		cmd, fmtConfigForLog(currentConfig), fmtUpdatedMembersForLog(updated), fmtMembersForLog(added), removed)
 
 	if currentConfig == nil {
 		return errors.New("current config cannot be nil")
 	}
 	newConfig := *currentConfig
 	// Mongo 4.4 onwards requires we process one change at a time.
-	// First do the adds.
+	// First do the updates.
+	for _, u := range updated {
+		haveChanges := false
+		for n, m := range newConfig.Members {
+			if m.Id != u.oldId {
+				continue
+			}
+			haveChanges = true
+			newConfig.Members[n] = u.Member
+			break
+		}
+		if !haveChanges {
+			return fmt.Errorf("cannot update member %#v in replicaset, no existing member", u)
+		}
+		newConfig.Version++
+		err := applyReplSetConfig(cmd, session, newConfig)
+		if err != nil {
+			return fmt.Errorf("cannot update member %#v in replicaset: %v", u, err)
+		}
+	}
+	// Then the adds.
 	for _, m := range added {
 		newConfig.Version++
 		newConfig.Members = append(newConfig.Members, m)
@@ -262,10 +302,25 @@ func applyReplSetConfigChanges(cmd string, session *mgo.Session, currentConfig *
 	return nil
 }
 
+type mgoSession interface {
+	// These are mocked for testing.
+
+	Run(cmd interface{}, result interface{}) error
+	Ping() error
+	Refresh()
+
+	// These are called by a function which is patched.
+
+	Clone() *mgo.Session
+	Close()
+	SetMode(consistency mgo.Mode, refresh bool)
+	DB(name string) *mgo.Database
+}
+
 // applyReplSetConfig applies the specified config to the mongo session.
 // It checks if the replica set changes cause the DB connection to be dropped.
 // If so, it Refreshes the session and tries to Ping again.
-func applyReplSetConfig(cmd string, session *mgo.Session, newConfig Config) error {
+func applyReplSetConfig(cmd string, session mgoSession, newConfig Config) error {
 	err := session.Run(bson.D{{"replSetReconfig", newConfig}}, nil)
 	if err == io.EOF {
 		// If the primary changes due to replSetReconfig, then all
@@ -328,7 +383,7 @@ outerLoop:
 		}
 		added = append(added, newMember)
 	}
-	return applyReplSetConfigChanges("Add", session, config, added, nil)
+	return applyReplSetConfigChanges("Add", session, config, nil, added, nil)
 }
 
 // Remove removes members with the given addresses from the replica set. It is
@@ -348,7 +403,7 @@ func Remove(session *mgo.Session, addrs ...string) error {
 			}
 		}
 	}
-	return applyReplSetConfigChanges("Remove", session, config, nil, toRemove)
+	return applyReplSetConfigChanges("Remove", session, config, nil, nil, toRemove)
 }
 
 // findMaxId looks through both sets of members and makes sure we cannot reuse an Id value
@@ -368,20 +423,27 @@ func findMaxId(oldMembers, newMembers []Member) int {
 	return max
 }
 
+type updatedMember struct {
+	oldId int
+	Member
+}
+
 // Set changes the current set of replica set members.  Members will have their
 // ids set automatically if their ids are not already > 0.
-func Set(session *mgo.Session, members []Member) error {
+func Set(session mgoSession, members []Member) error {
 	config, err := CurrentConfig(session)
 	if err != nil {
 		return err
 	}
 
-	// Assign existingIds to members that did not previously exist, starting above the
+	// Assign ids to members that did not previously exist, starting above the
 	// value of the highest id that already existed.
-	existingIds := map[string]int{}
+	existingAddressIds := map[string]int{}
+	existingIdAddresses := map[int]string{}
 	max := findMaxId(config.Members, members)
 	for _, m := range config.Members {
-		existingIds[m.Address] = m.Id
+		existingAddressIds[m.Address] = m.Id
+		existingIdAddresses[m.Id] = m.Address
 	}
 
 	// Gather the wanted ids so we can see which ones have been removed.
@@ -390,32 +452,47 @@ func Set(session *mgo.Session, members []Member) error {
 		wantIds[m.Address] = m.Id
 	}
 
-	// Compose the added members.
-	var added []Member
+	// Compose the added and updated members.
+	var (
+		added   []Member
+		updated []updatedMember
+		one     = 1.0
+		votes   = 1
+	)
 	for _, m := range members {
-		_, ok := existingIds[m.Address]
+		existingAddress, ok := existingIdAddresses[m.Id]
 		if ok {
+			if existingAddress != m.Address {
+				oldId := m.Id
+				max++
+				m.Id = max
+				updated = append(updated, updatedMember{
+					oldId:  oldId,
+					Member: m,
+				})
+			}
 			continue
 		}
 		if m.Id < 1 {
 			max++
 			m.Id = max
-			added = append(added, m)
 		}
+		m.Priority = &one
+		m.Votes = &votes
 		added = append(added, m)
 	}
 
 	// Remove all the wanted addresses from the existing ones.
 	// Any remaining are those to be removed.
 	for addr := range wantIds {
-		delete(existingIds, addr)
+		delete(existingAddressIds, addr)
 	}
 	var removed []int
-	for _, id := range existingIds {
+	for _, id := range existingAddressIds {
 		removed = append(removed, id)
 	}
 
-	return applyReplSetConfigChanges("Set", session, config, added, removed)
+	return applyReplSetConfigChanges("Set", session, config, updated, added, removed)
 }
 
 // IsMasterResults holds information about the configuration of a given mongo node.
@@ -480,7 +557,7 @@ func CurrentMembers(session *mgo.Session) ([]Member, error) {
 // there is no current config, the error returned will be mgo.ErrNotFound.
 var CurrentConfig = currentConfig
 
-func currentConfig(session *mgo.Session) (*Config, error) {
+func currentConfig(session mgoSession) (*Config, error) {
 	cfg := &Config{}
 	monotonicSession := session.Clone()
 	defer monotonicSession.Close()

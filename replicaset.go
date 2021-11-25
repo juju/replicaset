@@ -453,8 +453,12 @@ func Set(session mgoSession, members []Member) error {
 	}
 
 	// Compose the added and updated members.
-	var added []Member
-	var updated []updatedMember
+	var (
+		added   []Member
+		updated []updatedMember
+		one     = 1.0
+		votes   = 1
+	)
 	for _, m := range members {
 		existingAddress, ok := existingIdAddresses[m.Id]
 		if ok {
@@ -473,6 +477,8 @@ func Set(session mgoSession, members []Member) error {
 			max++
 			m.Id = max
 		}
+		m.Priority = &one
+		m.Votes = &votes
 		added = append(added, m)
 	}
 

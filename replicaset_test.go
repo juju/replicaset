@@ -840,6 +840,11 @@ func (s *changesSuite) TestSetNoChanges(c *gc.C) {
 	c.Assert(m.cfg, gc.IsNil)
 }
 
+var (
+	one   = 1.0
+	votes = 1
+)
+
 func (s *changesSuite) TestSetAdds(c *gc.C) {
 	s.current = []Member{{
 		Id:      1,
@@ -861,8 +866,10 @@ func (s *changesSuite) TestSetAdds(c *gc.C) {
 			Id:      1,
 			Address: "10.0.0.1",
 		}, {
-			Id:      2,
-			Address: "10.0.0.2",
+			Id:       2,
+			Address:  "10.0.0.2",
+			Priority: &one,
+			Votes:    &votes,
 		}},
 	})
 }
@@ -888,8 +895,10 @@ func (s *changesSuite) TestSetUpdates(c *gc.C) {
 			Id:      3,
 			Address: "10.0.0.2",
 		}, {
-			Id:      2,
-			Address: "10.0.0.3",
+			Id:       2,
+			Address:  "10.0.0.3",
+			Priority: &one,
+			Votes:    &votes,
 		}},
 	})
 }

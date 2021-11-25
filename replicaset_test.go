@@ -14,6 +14,7 @@ import (
 
 	"github.com/juju/errors"
 	"github.com/juju/mgo/v2"
+	"github.com/juju/mgo/v2/bson"
 	"github.com/juju/testing"
 	jc "github.com/juju/testing/checkers"
 	"github.com/juju/utils/v2"
@@ -782,6 +783,163 @@ func (s *MongoIPV6Suite) TestAddressFixing(c *gc.C) {
 	c.Check(result.Address, gc.Equals, ipv6GetAddr(root))
 	c.Check(result.PrimaryAddress, gc.Equals, ipv6GetAddr(root))
 	c.Check(result.Addresses, jc.DeepEquals, []string{ipv6GetAddr(root)})
+}
+
+type mockSession struct {
+	mgoSession
+	cfg *Config
+}
+
+func (m *mockSession) Run(cmd interface{}, _ interface{}) error {
+	data, ok := cmd.(bson.D)
+	if !ok {
+		return fmt.Errorf("unexpected cmd data %v", cmd)
+	}
+	if len(data) != 1 || data[0].Name != "replSetReconfig" {
+		return fmt.Errorf("unexpected cmd data %v", data)
+	}
+	cfg, ok := data[0].Value.(Config)
+	if !ok {
+		return fmt.Errorf("unexpected cmd data %v", data[0].Value)
+	}
+	m.cfg = &cfg
+	return nil
+}
+
+func (*mockSession) Ping() error { return nil }
+func (*mockSession) Refresh()    {}
+
+type changesSuite struct {
+	testing.IsolationSuite
+
+	current []Member
+}
+
+var _ = gc.Suite(&changesSuite{})
+
+func (s *changesSuite) SetUpTest(c *gc.C) {
+	s.PatchValue(&CurrentConfig, func(session mgoSession) (*Config, error) {
+		return &Config{
+			Members: s.current,
+		}, nil
+	})
+}
+
+func (s *changesSuite) TestSetNoChanges(c *gc.C) {
+	s.current = []Member{{
+		Id:      1,
+		Address: "10.0.0.1",
+	}}
+	m := &mockSession{}
+	wantMembers := []Member{{
+		Id:      1,
+		Address: "10.0.0.1",
+	}}
+	err := Set(m, wantMembers)
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, gc.IsNil)
+}
+
+func (s *changesSuite) TestSetAdds(c *gc.C) {
+	s.current = []Member{{
+		Id:      1,
+		Address: "10.0.0.1",
+	}}
+	m := &mockSession{}
+	wantMembers := []Member{{
+		Id:      1,
+		Address: "10.0.0.1",
+	}, {
+		Id:      2,
+		Address: "10.0.0.2",
+	}}
+	err := Set(m, wantMembers)
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, jc.DeepEquals, &Config{
+		Version: 1,
+		Members: []Member{{
+			Id:      1,
+			Address: "10.0.0.1",
+		}, {
+			Id:      2,
+			Address: "10.0.0.2",
+		}},
+	})
+}
+
+func (s *changesSuite) TestSetUpdates(c *gc.C) {
+	s.current = []Member{{
+		Id:      1,
+		Address: "10.0.0.1",
+	}}
+	m := &mockSession{}
+	wantMembers := []Member{{
+		Id:      1,
+		Address: "10.0.0.2",
+	}, {
+		Id:      2,
+		Address: "10.0.0.3",
+	}}
+	err := Set(m, wantMembers)
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, jc.DeepEquals, &Config{
+		Version: 2,
+		Members: []Member{{
+			Id:      3,
+			Address: "10.0.0.2",
+		}, {
+			Id:      2,
+			Address: "10.0.0.3",
+		}},
+	})
+}
+
+func (s *changesSuite) TestSetRemoves(c *gc.C) {
+	s.current = []Member{{
+		Id:      1,
+		Address: "10.0.0.1",
+	}, {
+		Id:      2,
+		Address: "10.0.0.2",
+	}}
+	m := &mockSession{}
+	wantMembers := []Member{{
+		Id:      1,
+		Address: "10.0.0.1",
+	}}
+	err := Set(m, wantMembers)
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, jc.DeepEquals, &Config{
+		Version: 1,
+		Members: []Member{{
+			Id:      1,
+			Address: "10.0.0.1",
+		}},
+	})
+}
+
+func (s *changesSuite) TestSetUpdateAndRemoves(c *gc.C) {
+	s.current = []Member{{
+		Id:      1,
+		Address: "10.0.0.1",
+	}, {
+		Id:      2,
+		Address: "10.0.0.2",
+	}}
+	m := &mockSession{}
+	wantMembers := []Member{{
+		Id:      1,
+		Address: "10.0.0.3",
+	}}
+	err := Set(m, wantMembers)
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, jc.DeepEquals, &Config{
+		Version: 2,
+		Members: []Member{{
+			Id:      3,
+			Address: "10.0.0.3",
+		}},
+	})
 }
 
 type fmtConfigForLogSuite struct {

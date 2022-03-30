@@ -3,6 +3,7 @@ module github.com/juju/replicaset/v2
 go 1.17
 
 require (
+	github.com/juju/collections v0.0.0-20220203020748-febd7cad8a7a
 	github.com/juju/errors v0.0.0-20220203013757-bd733f3c86b9
 	github.com/juju/loggo v0.0.0-20210728185423-eebad3a902c4
 	github.com/juju/mgo/v2 v2.0.0-20220111072304-f200228f1090
@@ -13,7 +14,6 @@ require (
 
 require (
 	github.com/juju/clock v0.0.0-20220203021603-d9deb868a28a // indirect
-	github.com/juju/collections v0.0.0-20220203020748-febd7cad8a7a // indirect
 	github.com/juju/retry v0.0.0-20220204093819-62423bf33287 // indirect
 	github.com/juju/version/v2 v2.0.0-20220204124744-fc9915e3d935 // indirect
 	github.com/kr/pretty v0.2.1 // indirect

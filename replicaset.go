@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/juju/collections/set"
 	"github.com/juju/errors"
 	"github.com/juju/loggo"
 	"github.com/juju/mgo/v2"
@@ -220,9 +221,9 @@ func fmtMembersForLog(membersToLog []Member) string {
 
 // fmtUpdatedMembersForLog generates a succinct string suitable for debugging what the Members are up to.
 // Note that Members will be printed in Id sorted order, regardless of the order in membersToLog.
-func fmtUpdatedMembersForLog(membersToLog []updatedMember) string {
+func fmtUpdatedMembersForLog(membersToLog []Member) string {
 	memberInfo := make([]string, len(membersToLog))
-	members := append([]updatedMember(nil), membersToLog...)
+	members := append([]Member(nil), membersToLog...)
 	sort.SliceStable(members, func(i, j int) bool { return members[i].Id < members[j].Id })
 	for i, member := range members {
 		voting := "not-voting"
@@ -233,14 +234,14 @@ func fmtUpdatedMembersForLog(membersToLog []updatedMember) string {
 		for key, val := range member.Tags {
 			tags = append(tags, fmt.Sprintf("%s:%s", key, val))
 		}
-		memberInfo[i] = fmt.Sprintf("    {%d (was %d) %q %v %s},", member.Id, member.oldId, member.Address, strings.Join(tags, ", "), voting)
+		memberInfo[i] = fmt.Sprintf("    {%d %q %v %s},", member.Id, member.Address, strings.Join(tags, ", "), voting)
 	}
 	return strings.Join(memberInfo, "\n")
 }
 
 // applyReplSetConfigChanges applies the specified changes to the mongo session.
 // It also logs what the changes are.
-func applyReplSetConfigChanges(cmd string, session mgoSession, currentConfig *Config, updated []updatedMember, added []Member, removed []int) error {
+func applyReplSetConfigChanges(cmd string, session mgoSession, currentConfig *Config, updated []Member, added []Member, removed []int) error {
 	logger.Debugf("%s() changing replica set\n%s\n- updated:\n%#v\n- added:\n%s\n- removed: %v",
 		cmd, fmtConfigForLog(currentConfig), fmtUpdatedMembersForLog(updated), fmtMembersForLog(added), removed)
 
@@ -252,12 +253,9 @@ func applyReplSetConfigChanges(cmd string, session mgoSession, currentConfig *Co
 	// First do the updates.
 	for _, u := range updated {
 		haveChanges := false
-		for n, m := range newConfig.Members {
-			if m.Id != u.oldId {
-				continue
-			}
+		for n := range newConfig.Members {
 			haveChanges = true
-			newConfig.Members[n] = u.Member
+			newConfig.Members[n] = u
 			break
 		}
 		if !haveChanges {
@@ -423,11 +421,6 @@ func findMaxId(oldMembers, newMembers []Member) int {
 	return max
 }
 
-type updatedMember struct {
-	oldId int
-	Member
-}
-
 // Set changes the current set of replica set members.  Members will have their
 // ids set automatically if their ids are not already > 0.
 func Set(session mgoSession, members []Member) error {
@@ -439,11 +432,11 @@ func Set(session mgoSession, members []Member) error {
 	// Assign ids to members that did not previously exist, starting above the
 	// value of the highest id that already existed.
 	existingAddressIds := map[string]int{}
-	existingIdAddresses := map[int]string{}
+	existingMembers := map[int]Member{}
 	max := findMaxId(config.Members, members)
 	for _, m := range config.Members {
 		existingAddressIds[m.Address] = m.Id
-		existingIdAddresses[m.Id] = m.Address
+		existingMembers[m.Id] = m
 	}
 
 	// Gather the wanted ids so we can see which ones have been removed.
@@ -455,21 +448,17 @@ func Set(session mgoSession, members []Member) error {
 	// Compose the added and updated members.
 	var (
 		added   []Member
-		updated []updatedMember
+		updated []Member
 		one     = 1.0
 		votes   = 1
 	)
+	updatedIds := set.NewInts()
 	for _, m := range members {
-		existingAddress, ok := existingIdAddresses[m.Id]
+		existingMember, ok := existingMembers[m.Id]
 		if ok {
-			if existingAddress != m.Address {
-				oldId := m.Id
-				max++
-				m.Id = max
-				updated = append(updated, updatedMember{
-					oldId:  oldId,
-					Member: m,
-				})
+			if existingMember.Address != m.Address {
+				updatedIds.Add(m.Id)
+				updated = append(updated, m)
 			}
 			continue
 		}
@@ -487,12 +476,14 @@ func Set(session mgoSession, members []Member) error {
 	for addr := range wantIds {
 		delete(existingAddressIds, addr)
 	}
-	var removed []int
+	var removedIds []int
 	for _, id := range existingAddressIds {
-		removed = append(removed, id)
+		if !updatedIds.Contains(id) {
+			removedIds = append(removedIds, id)
+		}
 	}
 
-	return applyReplSetConfigChanges("Set", session, config, updated, added, removed)
+	return applyReplSetConfigChanges("Set", session, config, updated, added, removedIds)
 }
 
 // IsMasterResults holds information about the configuration of a given mongo node.

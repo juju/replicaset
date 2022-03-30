@@ -892,7 +892,7 @@ func (s *changesSuite) TestSetUpdates(c *gc.C) {
 	c.Assert(m.cfg, jc.DeepEquals, &Config{
 		Version: 2,
 		Members: []Member{{
-			Id:      3,
+			Id:      1,
 			Address: "10.0.0.2",
 		}, {
 			Id:       2,
@@ -945,7 +945,7 @@ func (s *changesSuite) TestSetUpdateAndRemoves(c *gc.C) {
 	c.Assert(m.cfg, jc.DeepEquals, &Config{
 		Version: 2,
 		Members: []Member{{
-			Id:      3,
+			Id:      1,
 			Address: "10.0.0.3",
 		}},
 	})

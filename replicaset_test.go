@@ -13,8 +13,9 @@ import (
 	"time"
 
 	"github.com/juju/errors"
-	"github.com/juju/mgo/v2"
-	"github.com/juju/mgo/v2/bson"
+	"github.com/juju/mgo/v3"
+	"github.com/juju/mgo/v3/bson"
+	mgotesting "github.com/juju/mgo/v3/testing"
 	"github.com/juju/testing"
 	jc "github.com/juju/testing/checkers"
 	"github.com/juju/utils/v3"
@@ -29,11 +30,11 @@ func TestPackage(t *stdtesting.T) {
 
 type MongoSuite struct {
 	testing.IsolationSuite
-	root *testing.MgoInstance
+	root *mgotesting.MgoInstance
 }
 
-func newServer(c *gc.C) *testing.MgoInstance {
-	inst := &testing.MgoInstance{Params: []string{"--replSet", rsName}}
+func newServer(c *gc.C) *mgotesting.MgoInstance {
+	inst := &mgotesting.MgoInstance{Params: []string{"--replSet", rsName}}
 	err := inst.Start(nil)
 	c.Assert(err, jc.ErrorIsNil)
 
@@ -86,7 +87,7 @@ func assertMembers(c *gc.C, mems []Member, expectedMembers []Member) {
 	}
 }
 
-func dialAndTestInitiate(c *gc.C, inst *testing.MgoInstance, addr string) {
+func dialAndTestInitiate(c *gc.C, inst *mgotesting.MgoInstance, addr string) {
 	session := inst.MustDialDirect()
 	defer session.Close()
 
@@ -227,13 +228,13 @@ func (s *MongoSuite) TestAddRemoveSet(c *gc.C) {
 	if runtime.GOARCH == "386" {
 		c.Skip(fmt.Sprintf("Test disabled on i386 until fixed - see bug lp:1425569"))
 	}
-	getAddr := func(inst *testing.MgoInstance) string {
+	getAddr := func(inst *mgotesting.MgoInstance) string {
 		return inst.Addr()
 	}
 	assertAddRemoveSet(c, s.root, getAddr)
 }
 
-func assertAddRemoveSet(c *gc.C, root *testing.MgoInstance, getAddr func(*testing.MgoInstance) string) {
+func assertAddRemoveSet(c *gc.C, root *mgotesting.MgoInstance, getAddr func(*mgotesting.MgoInstance) string) {
 	session := root.MustDial()
 	defer session.Close()
 
@@ -252,7 +253,7 @@ func assertAddRemoveSet(c *gc.C, root *testing.MgoInstance, getAddr func(*testin
 	// operations without thrashing on those that take longer.
 	strategy := utils.AttemptStrategy{Total: time.Minute * 2, Delay: time.Millisecond * 500}
 
-	instances := make([]*testing.MgoInstance, 5)
+	instances := make([]*mgotesting.MgoInstance, 5)
 	instances[0] = root
 	for i := 1; i < len(instances); i++ {
 		inst := newServer(c)
@@ -383,7 +384,7 @@ func (s *MongoSuite) TestMasterHostPort(c *gc.C) {
 }
 
 func (s *MongoSuite) TestMasterHostPortOnUnconfiguredReplicaSet(c *gc.C) {
-	inst := &testing.MgoInstance{}
+	inst := &mgotesting.MgoInstance{}
 	err := inst.Start(nil)
 	c.Assert(err, jc.ErrorIsNil)
 	defer inst.Destroy()
@@ -739,7 +740,7 @@ func (s *MongoSuite) TestStepDownPrimary(c *gc.C) {
 	c.Check(newPrimary, gc.Not(gc.Equals), initialPrimary)
 }
 
-func ipv6GetAddr(inst *testing.MgoInstance) string {
+func ipv6GetAddr(inst *mgotesting.MgoInstance) string {
 	return fmt.Sprintf("[::1]:%v", inst.Port())
 }
 

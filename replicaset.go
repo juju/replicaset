@@ -43,6 +43,7 @@ const (
 var logger = loggo.GetLogger("juju.replicaset")
 
 var (
+	getCurrentConfig = CurrentConfig
 	getCurrentStatus = CurrentStatus
 	getBuildInfo     = BuildInfo
 	isReady          = IsReady
@@ -51,7 +52,7 @@ var (
 
 // doAttemptInitiate will attempt to initiate a mongodb replicaset with each of
 // the given configs, returning as soon as one config is successful.
-func doAttemptInitiate(monotonicSession *mgo.Session, cfg []Config) error {
+func doAttemptInitiate(monotonicSession mgoSession, cfg []Config) error {
 	var err error
 	for _, c := range cfg {
 		logger.Infof("Initiating replicaset with config: %s", fmtConfigForLog(&c))
@@ -74,7 +75,7 @@ func doAttemptInitiate(monotonicSession *mgo.Session, cfg []Config) error {
 //
 // See http://docs.mongodb.org/manual/reference/method/rs.initiate/ for more
 // details.
-func Initiate(session *mgo.Session, address, name string, tags map[string]string) error {
+func Initiate(session mgoSession, address, name string, tags map[string]string) error {
 	monotonicSession := session.Clone()
 	defer monotonicSession.Close()
 	monotonicSession.SetMode(mgo.Monotonic, true)
@@ -186,6 +187,10 @@ type Member struct {
 	Votes *int `bson:"votes,omitempty"`
 }
 
+func (m *Member) GoString() string {
+	return fmtMembersForLog([]Member{*m})
+}
+
 // fmtConfigForLog generates a succinct string suitable for debugging.
 func fmtConfigForLog(config *Config) string {
 	return fmt.Sprintf(`{
@@ -207,7 +212,7 @@ func fmtMembersForLog(membersToLog []Member) string {
 	sort.SliceStable(members, func(i, j int) bool { return members[i].Id < members[j].Id })
 	for i, member := range members {
 		voting := "not-voting"
-		if member.Votes == nil || *member.Votes > 0 {
+		if hasVote(member) {
 			voting = "voting"
 		}
 		var tags []string
@@ -227,7 +232,7 @@ func fmtUpdatedMembersForLog(membersToLog []Member) string {
 	sort.SliceStable(members, func(i, j int) bool { return members[i].Id < members[j].Id })
 	for i, member := range members {
 		voting := "not-voting"
-		if member.Votes == nil || *member.Votes > 0 {
+		if hasVote(member) {
 			voting = "voting"
 		}
 		var tags []string
@@ -254,6 +259,11 @@ func applyReplSetConfigChanges(cmd string, session mgoSession, currentConfig *Co
 	for _, u := range updated {
 		haveChanges := false
 		for n := range newConfig.Members {
+			// Replace a member with the same id.
+			m := newConfig.Members[n]
+			if m.Id != u.Id {
+				continue
+			}
 			haveChanges = true
 			newConfig.Members[n] = u
 			break
@@ -278,6 +288,22 @@ func applyReplSetConfigChanges(cmd string, session mgoSession, currentConfig *Co
 	}
 
 	// Then do the removes.
+	err := applyRemoves(cmd, session, newConfig, removed)
+	if errors.Is(err, repairNeeded) {
+		// If the replicaset gets out of sync, attempt a repair and retry.
+		if err := repairReplicaSet(session, removed); err != nil {
+			return errors.Annotatef(err, "repairing replicaset")
+		}
+		updatedConfig, err := getCurrentConfig(session)
+		if err != nil {
+			return err
+		}
+		return applyRemoves(cmd, session, *updatedConfig, removed)
+	}
+	return err
+}
+
+func applyRemoves(cmd string, session mgoSession, newConfig Config, removed []int) error {
 	for _, id := range removed {
 		haveChanges := false
 		for n, m := range newConfig.Members {
@@ -294,7 +320,7 @@ func applyReplSetConfigChanges(cmd string, session mgoSession, currentConfig *Co
 		newConfig.Version++
 		err := applyReplSetConfig(cmd, session, newConfig)
 		if err != nil {
-			return fmt.Errorf("cannot remove member %d from replicaset: %v", id, err)
+			return fmt.Errorf("cannot remove member %d from replicaset: %w", id, err)
 		}
 	}
 	return nil
@@ -313,13 +339,25 @@ type mgoSession interface {
 	Close()
 	SetMode(consistency mgo.Mode, refresh bool)
 	DB(name string) *mgo.Database
+	BuildInfo() (mgo.BuildInfo, error)
 }
+
+var repairNeeded = errors.ConstError("repair needed")
 
 // applyReplSetConfig applies the specified config to the mongo session.
 // It checks if the replica set changes cause the DB connection to be dropped.
 // If so, it Refreshes the session and tries to Ping again.
 func applyReplSetConfig(cmd string, session mgoSession, newConfig Config) error {
 	err := session.Run(bson.D{{"replSetReconfig", newConfig}}, nil)
+	if err != nil {
+		qe, ok := err.(*mgo.QueryError)
+		// This error occurs when the replicaset changes can't be synced
+		// to all nodes and the primary is forced to become a secondary
+		// because quorum is lost.
+		if ok && qe.Code == 11602 {
+			return repairNeeded
+		}
+	}
 	if err == io.EOF {
 		// If the primary changes due to replSetReconfig, then all
 		// current connections are dropped.
@@ -343,6 +381,63 @@ func applyReplSetConfig(cmd string, session mgoSession, newConfig Config) error 
 	return err
 }
 
+// repairReplicaSet will remove any unhealthy nodes that are in the
+// removed list and then force a remaining secondary to become a primary.
+func repairReplicaSet(session mgoSession, removed []int) error {
+	cfg, err := getCurrentConfig(session)
+	if err != nil {
+		return errors.Annotatef(err, "getting rs config to repair")
+	}
+
+	status, err := getCurrentStatus(session)
+	if err != nil {
+		return errors.Annotatef(err, "getting rs status to repair")
+	}
+
+	cfg.Version++
+	removedIds := set.NewInts(removed...)
+	haveChanges := false
+	haveUnhealthy := false
+	for n, m := range status.Members {
+		haveUnhealthy = haveUnhealthy || !m.Healthy
+		if !m.Healthy && removedIds.Contains(m.Id) {
+			haveChanges = true
+			cfg.Members = append(cfg.Members[:n], cfg.Members[n+1:]...)
+		}
+	}
+	// If there are unhealthy nodes not in the to remove list,
+	// we can't safely repair.
+	if !haveChanges && haveUnhealthy {
+		return errors.Errorf("cannot repair replicaset")
+	}
+	err = session.Run(bson.D{
+		{"replSetReconfig", *cfg},
+		{"force", "true"},
+	}, nil)
+	if err != nil {
+		return errors.Annotatef(err, "repairing rs")
+	}
+	logger.Infof("replicaset repair done, waiting for new primary")
+	// Poll 5 times.
+	backoffms := 1000.0
+gotprimary:
+	for i := 0; i < 5; i++ {
+		status, err := getCurrentStatus(session)
+		if err != nil {
+			return errors.Annotatef(err, "checking rs status to repair")
+		}
+		for _, m := range status.Members {
+			if m.State == PrimaryState {
+				break gotprimary
+			}
+		}
+		logger.Debugf("still waiting for primary...")
+		time.Sleep(time.Duration(backoffms) * time.Millisecond)
+		backoffms *= 1.2
+	}
+	return nil
+}
+
 var localHostIpv4 = regexp.MustCompile(`127\.0\.0\.\d+`)
 
 func isLocalhost(addr string) bool {
@@ -356,8 +451,8 @@ func isLocalhost(addr string) bool {
 // existing replicas will be ignored.
 //
 // Members will have their Ids set automatically if they are not already > 0
-func Add(session *mgo.Session, members ...Member) error {
-	config, err := CurrentConfig(session)
+func Add(session mgoSession, members ...Member) error {
+	config, err := getCurrentConfig(session)
 	if err != nil {
 		return err
 	}
@@ -386,8 +481,8 @@ outerLoop:
 
 // Remove removes members with the given addresses from the replica set. It is
 // not an error to remove addresses of non-existent replica set members.
-func Remove(session *mgo.Session, addrs ...string) error {
-	config, err := CurrentConfig(session)
+func Remove(session mgoSession, addrs ...string) error {
+	config, err := getCurrentConfig(session)
 	if err != nil {
 		return err
 	}
@@ -421,10 +516,14 @@ func findMaxId(oldMembers, newMembers []Member) int {
 	return max
 }
 
+func hasVote(m Member) bool {
+	return m.Votes == nil || *m.Votes > 0
+}
+
 // Set changes the current set of replica set members.  Members will have their
 // ids set automatically if their ids are not already > 0.
 func Set(session mgoSession, members []Member) error {
-	config, err := CurrentConfig(session)
+	config, err := getCurrentConfig(session)
 	if err != nil {
 		return err
 	}
@@ -456,7 +555,7 @@ func Set(session mgoSession, members []Member) error {
 	for _, m := range members {
 		existingMember, ok := existingMembers[m.Id]
 		if ok {
-			if existingMember.Address != m.Address {
+			if existingMember.Address != m.Address || hasVote(existingMember) != hasVote(m) {
 				updatedIds.Add(m.Id)
 				updated = append(updated, m)
 			}
@@ -504,7 +603,7 @@ type IsMasterResults struct {
 
 // IsMaster returns information about the configuration of the node that
 // the given session is connected to.
-func IsMaster(session *mgo.Session) (*IsMasterResults, error) {
+func IsMaster(session mgoSession) (*IsMasterResults, error) {
 	results := &IsMasterResults{}
 	err := session.Run("isMaster", results)
 	if err != nil {
@@ -524,7 +623,7 @@ var ErrMasterNotConfigured = fmt.Errorf("mongo master not configured")
 // MasterHostPort returns the "address:port" string for the primary
 // mongo server in the replicaset. It returns ErrMasterNotConfigured if
 // the replica set has not yet been initiated.
-func MasterHostPort(session *mgo.Session) (string, error) {
+func MasterHostPort(session mgoSession) (string, error) {
 	results, err := IsMaster(session)
 	if err != nil {
 		return "", err
@@ -536,8 +635,8 @@ func MasterHostPort(session *mgo.Session) (string, error) {
 }
 
 // CurrentMembers returns the current members of the replica set.
-func CurrentMembers(session *mgo.Session) ([]Member, error) {
-	cfg, err := CurrentConfig(session)
+func CurrentMembers(session mgoSession) ([]Member, error) {
+	cfg, err := getCurrentConfig(session)
 	if err != nil {
 		return nil, err
 	}
@@ -546,9 +645,7 @@ func CurrentMembers(session *mgo.Session) ([]Member, error) {
 
 // CurrentConfig returns the Config for the given session's replica set.  If
 // there is no current config, the error returned will be mgo.ErrNotFound.
-var CurrentConfig = currentConfig
-
-func currentConfig(session mgoSession) (*Config, error) {
+func CurrentConfig(session mgoSession) (*Config, error) {
 	cfg := &Config{}
 	monotonicSession := session.Clone()
 	defer monotonicSession.Close()
@@ -587,7 +684,7 @@ type Config struct {
 // Note that triggering a step down causes all client connections to be
 // disconnected. We explicitly treat the io.EOF we get as not being an error,
 // but all other sessions will also be disconnected.
-func StepDownPrimary(session *mgo.Session) error {
+func StepDownPrimary(session mgoSession) error {
 	strictSession := session.Clone()
 	defer strictSession.Close()
 	// StepDown can only be called on the primary
@@ -607,12 +704,12 @@ func StepDownPrimary(session *mgo.Session) error {
 }
 
 // BuildInfo returns the mongod build info for the given session.
-func BuildInfo(session *mgo.Session) (mgo.BuildInfo, error) {
+func BuildInfo(session mgoSession) (mgo.BuildInfo, error) {
 	return session.BuildInfo()
 }
 
 // CurrentStatus returns the status of the replica set for the given session.
-func CurrentStatus(session *mgo.Session) (*Status, error) {
+func CurrentStatus(session mgoSession) (*Status, error) {
 	status := &Status{}
 	err := session.Run("replSetGetStatus", status)
 	if err != nil {
@@ -670,7 +767,7 @@ type MemberStatus struct {
 // IsReady checks on the status of all members in the replicaset
 // associated with the provided session. If we can connect and the majority of
 // members are ready then the result is true.
-func IsReady(session *mgo.Session) (bool, error) {
+func IsReady(session mgoSession) (bool, error) {
 	status, err := getCurrentStatus(session)
 	if isConnectionNotAvailable(err) {
 		// The connection dropped...
@@ -727,7 +824,7 @@ func isConnectionNotAvailable(err error) bool {
 // WaitUntilReady waits until all members of the replicaset are ready.
 // It will retry every 10 seconds until the timeout is reached. Dropped
 // connections will trigger a reconnect.
-func WaitUntilReady(session *mgo.Session, timeout int) error {
+func WaitUntilReady(session mgoSession, timeout int) error {
 	attempts := utils.AttemptStrategy{
 		Delay: 10 * time.Second,
 		Total: time.Duration(timeout) * time.Second,

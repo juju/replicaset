@@ -6,7 +6,6 @@ package replicaset
 import (
 	"fmt"
 	"io"
-	"runtime"
 	"sort"
 	"strings"
 	stdtesting "testing"
@@ -120,7 +119,7 @@ func (s *MongoSuite) TestInitiateSetsProtocolVersion(c *gc.C) {
 	session := s.root.MustDialDirect()
 	defer session.Close()
 
-	mockBuildInfo := func(session *mgo.Session) (mgo.BuildInfo, error) {
+	mockBuildInfo := func(session mgoSession) (mgo.BuildInfo, error) {
 		return mgo.BuildInfo{
 			Version:      "4",
 			GitVersion:   "4.0.0",
@@ -128,7 +127,7 @@ func (s *MongoSuite) TestInitiateSetsProtocolVersion(c *gc.C) {
 		}, nil
 	}
 	called := false
-	mockAttemptInitiate := func(monotonicSession *mgo.Session, cfg []Config) error {
+	mockAttemptInitiate := func(monotonicSession mgoSession, cfg []Config) error {
 		c.Assert(cfg, gc.HasLen, 2)
 		if cfg[0].ProtocolVersion != 1 {
 			c.Fatalf("obtained protocol version %d, expected 1", cfg[0].ProtocolVersion)
@@ -136,7 +135,7 @@ func (s *MongoSuite) TestInitiateSetsProtocolVersion(c *gc.C) {
 		called = true
 		return nil
 	}
-	mockCurentStatus := func(session *mgo.Session) (*Status, error) {
+	mockCurentStatus := func(session mgoSession) (*Status, error) {
 		return &Status{
 			Name:    "test",
 			Members: []MemberStatus{{}},
@@ -160,7 +159,7 @@ func (s *MongoSuite) TestInitiateWaitsForStatus(c *gc.C) {
 	defer session.Close()
 
 	i := 0
-	mockStatus := func(session *mgo.Session) (*Status, error) {
+	mockStatus := func(session mgoSession) (*Status, error) {
 		status := &Status{}
 		var err error
 		i += 1
@@ -181,7 +180,7 @@ func (s *MongoSuite) TestInitiateWaitsForStatus(c *gc.C) {
 	c.Assert(i, gc.Equals, 21)
 }
 
-func loadData(session *mgo.Session, c *gc.C) {
+func loadData(session mgoSession, c *gc.C) {
 	type foo struct {
 		Name    string
 		Address string
@@ -225,9 +224,6 @@ func attemptLoop(c *gc.C, strategy utils.AttemptStrategy, desc string, f func() 
 }
 
 func (s *MongoSuite) TestAddRemoveSet(c *gc.C) {
-	if runtime.GOARCH == "386" {
-		c.Skip(fmt.Sprintf("Test disabled on i386 until fixed - see bug lp:1425569"))
-	}
 	getAddr := func(inst *mgotesting.MgoInstance) string {
 		return inst.Addr()
 	}
@@ -396,7 +392,7 @@ func (s *MongoSuite) TestMasterHostPortOnUnconfiguredReplicaSet(c *gc.C) {
 
 func (s *MongoSuite) TestIsReadyOne(c *gc.C) {
 	s.PatchValue(&getCurrentStatus,
-		func(session *mgo.Session) (*Status, error) {
+		func(session mgoSession) (*Status, error) {
 			status := &Status{Members: []MemberStatus{{
 				Id:      1,
 				Healthy: true,
@@ -415,7 +411,7 @@ func (s *MongoSuite) TestIsReadyOne(c *gc.C) {
 
 func (s *MongoSuite) TestIsReadyMultiple(c *gc.C) {
 	s.PatchValue(&getCurrentStatus,
-		func(session *mgo.Session) (*Status, error) {
+		func(session mgoSession) (*Status, error) {
 			status := &Status{}
 			for i := 1; i < 5; i++ {
 				member := MemberStatus{Id: i + 1, Healthy: true}
@@ -435,7 +431,7 @@ func (s *MongoSuite) TestIsReadyMultiple(c *gc.C) {
 
 func (s *MongoSuite) TestIsReadyNotOne(c *gc.C) {
 	s.PatchValue(&getCurrentStatus,
-		func(session *mgo.Session) (*Status, error) {
+		func(session mgoSession) (*Status, error) {
 			status := &Status{Members: []MemberStatus{{
 				Id:      1,
 				Healthy: false,
@@ -454,7 +450,7 @@ func (s *MongoSuite) TestIsReadyNotOne(c *gc.C) {
 
 func (s *MongoSuite) TestIsReadyMinority(c *gc.C) {
 	s.PatchValue(&getCurrentStatus,
-		func(session *mgo.Session) (*Status, error) {
+		func(session mgoSession) (*Status, error) {
 			status := &Status{Members: []MemberStatus{{
 				Id:      1,
 				Healthy: true,
@@ -481,7 +477,7 @@ func (s *MongoSuite) TestIsReadyMinority(c *gc.C) {
 
 func (s *MongoSuite) checkConnectionFailure(c *gc.C, failure error) {
 	s.PatchValue(&getCurrentStatus,
-		func(session *mgo.Session) (*Status, error) { return nil, failure },
+		func(session mgoSession) (*Status, error) { return nil, failure },
 	)
 	session := s.root.MustDial()
 	defer session.Close()
@@ -506,7 +502,7 @@ func (s *MongoSuite) TestIsReadyConnectionFailedWithErrno(c *gc.C) {
 func (s *MongoSuite) TestIsReadyError(c *gc.C) {
 	failure := errors.New("failed!")
 	s.PatchValue(&getCurrentStatus,
-		func(session *mgo.Session) (*Status, error) { return nil, failure },
+		func(session mgoSession) (*Status, error) { return nil, failure },
 	)
 	session := s.root.MustDial()
 	defer session.Close()
@@ -517,7 +513,7 @@ func (s *MongoSuite) TestIsReadyError(c *gc.C) {
 
 func (s *MongoSuite) TestWaitUntilReady(c *gc.C) {
 	var isReadyCalled bool
-	mockIsReady := func(session *mgo.Session) (bool, error) {
+	mockIsReady := func(session mgoSession) (bool, error) {
 		isReadyCalled = true
 		return true, nil
 	}
@@ -532,7 +528,7 @@ func (s *MongoSuite) TestWaitUntilReady(c *gc.C) {
 }
 
 func (s *MongoSuite) TestWaitUntilReadyTimeout(c *gc.C) {
-	mockIsReady := func(session *mgo.Session) (bool, error) {
+	mockIsReady := func(session mgoSession) (bool, error) {
 		return false, nil
 	}
 
@@ -545,7 +541,7 @@ func (s *MongoSuite) TestWaitUntilReadyTimeout(c *gc.C) {
 }
 
 func (s *MongoSuite) TestWaitUntilReadyError(c *gc.C) {
-	mockIsReady := func(session *mgo.Session) (bool, error) {
+	mockIsReady := func(session mgoSession) (bool, error) {
 		return false, errors.New("foobar")
 	}
 
@@ -651,7 +647,7 @@ func closeEnough(expected, obtained time.Time) bool {
 	return (-500*time.Millisecond) < t && t < (500*time.Millisecond)
 }
 
-func findPrimary(c *gc.C, session *mgo.Session) int {
+func findPrimary(c *gc.C, session mgoSession) int {
 	status, err := CurrentStatus(session)
 	c.Assert(err, jc.ErrorIsNil)
 	for i, m := range status.Members {
@@ -788,7 +784,8 @@ func (s *MongoIPV6Suite) TestAddressFixing(c *gc.C) {
 
 type mockSession struct {
 	mgoSession
-	cfg *Config
+	cfg      *Config
+	repaired bool
 }
 
 func (m *mockSession) Run(cmd interface{}, _ interface{}) error {
@@ -796,12 +793,22 @@ func (m *mockSession) Run(cmd interface{}, _ interface{}) error {
 	if !ok {
 		return fmt.Errorf("unexpected cmd data %v", cmd)
 	}
-	if len(data) != 1 || data[0].Name != "replSetReconfig" {
+	if len(data) < 1 || data[0].Name != "replSetReconfig" {
 		return fmt.Errorf("unexpected cmd data %v", data)
 	}
 	cfg, ok := data[0].Value.(Config)
 	if !ok {
 		return fmt.Errorf("unexpected cmd data %v", data[0].Value)
+	}
+	if len(data) > 1 {
+		force, ok := data[1].Value.(string)
+		if !ok || force != "true" {
+			return fmt.Errorf("unexpected force value %v", data[1].Value)
+		}
+		m.repaired = true
+	}
+	if !m.repaired && len(cfg.Members) == 1 && cfg.Members[0].Id == 666 {
+		return &mgo.QueryError{Code: 11602}
 	}
 	m.cfg = &cfg
 	return nil
@@ -819,7 +826,7 @@ type changesSuite struct {
 var _ = gc.Suite(&changesSuite{})
 
 func (s *changesSuite) SetUpTest(c *gc.C) {
-	s.PatchValue(&CurrentConfig, func(session mgoSession) (*Config, error) {
+	s.PatchValue(&getCurrentConfig, func(session mgoSession) (*Config, error) {
 		return &Config{
 			Members: s.current,
 		}, nil
@@ -842,8 +849,9 @@ func (s *changesSuite) TestSetNoChanges(c *gc.C) {
 }
 
 var (
-	one   = 1.0
-	votes = 1
+	one     = 1.0
+	votes   = 1
+	novotes = 0
 )
 
 func (s *changesSuite) TestSetAdds(c *gc.C) {
@@ -875,28 +883,67 @@ func (s *changesSuite) TestSetAdds(c *gc.C) {
 	})
 }
 
-func (s *changesSuite) TestSetUpdates(c *gc.C) {
+func (s *changesSuite) TestSetUpdateAddress(c *gc.C) {
 	s.current = []Member{{
-		Id:      1,
+		Id:      4,
 		Address: "10.0.0.1",
 	}}
 	m := &mockSession{}
 	wantMembers := []Member{{
-		Id:      1,
-		Address: "10.0.0.2",
-	}, {
-		Id:      2,
+		Id:      5,
 		Address: "10.0.0.3",
+	}, {
+		Id:      4,
+		Address: "10.0.0.2",
 	}}
 	err := Set(m, wantMembers)
 	c.Assert(err, jc.ErrorIsNil)
 	c.Assert(m.cfg, jc.DeepEquals, &Config{
 		Version: 2,
 		Members: []Member{{
-			Id:      1,
+			Id:      4,
 			Address: "10.0.0.2",
 		}, {
-			Id:       2,
+			Id:       5,
+			Address:  "10.0.0.3",
+			Priority: &one,
+			Votes:    &votes,
+		}},
+	})
+}
+
+func (s *changesSuite) TestSetUpdateVote(c *gc.C) {
+	s.current = []Member{{
+		Id:       4,
+		Address:  "10.0.0.2",
+		Priority: &one,
+		Votes:    &votes,
+	}, {
+		Id:      5,
+		Address: "10.0.0.3",
+		Votes:   &novotes,
+	}}
+	m := &mockSession{}
+	wantMembers := []Member{{
+		Id:       5,
+		Address:  "10.0.0.3",
+		Priority: &one,
+		Votes:    &votes,
+	}, {
+		Id:      4,
+		Address: "10.0.0.2",
+		Votes:   &novotes,
+	}}
+	err := Set(m, wantMembers)
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, jc.DeepEquals, &Config{
+		Version: 2,
+		Members: []Member{{
+			Id:      4,
+			Address: "10.0.0.2",
+			Votes:   &novotes,
+		}, {
+			Id:       5,
 			Address:  "10.0.0.3",
 			Priority: &one,
 			Votes:    &votes,
@@ -950,6 +997,45 @@ func (s *changesSuite) TestSetUpdateAndRemoves(c *gc.C) {
 			Address: "10.0.0.3",
 		}},
 	})
+}
+
+func (s *changesSuite) TestRepair(c *gc.C) {
+	mockCurentStatus := func(session mgoSession) (*Status, error) {
+		return &Status{
+			Name: "test",
+			Members: []MemberStatus{{
+				Id:    666,
+				State: PrimaryState,
+			}, {
+				Id:      1,
+				Healthy: false,
+			}},
+		}, nil
+	}
+	s.PatchValue(&getCurrentStatus, mockCurentStatus)
+
+	s.current = []Member{{
+		Id:      1,
+		Address: "10.0.0.1",
+	}, {
+		Id:      666,
+		Address: "10.0.0.2",
+	}}
+	m := &mockSession{}
+	wantMembers := []Member{{
+		Id:      666,
+		Address: "10.0.0.2",
+	}}
+	err := Set(m, wantMembers)
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, jc.DeepEquals, &Config{
+		Version: 1,
+		Members: []Member{{
+			Id:      666,
+			Address: "10.0.0.2",
+		}},
+	})
+	c.Assert(m.repaired, jc.IsTrue)
 }
 
 type fmtConfigForLogSuite struct {

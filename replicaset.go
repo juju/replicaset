@@ -726,11 +726,21 @@ func sameAddress(a, b string) bool {
 	}
 	ipA, errA := netip.ParseAddr(ha)
 	ipB, errB := netip.ParseAddr(hb)
-	if errA == nil && errB == nil {
+	switch {
+	case errA == nil && errB == nil:
 		// Distinct loopback IPs can host different servers on the same port.
 		return ipA.Unmap() == ipB.Unmap()
+	case errA == nil:
+		return hb == "localhost" && localhostIP(ipA)
+	case errB == nil:
+		return ha == "localhost" && localhostIP(ipB)
 	}
 	return ha == hb
+}
+
+func localhostIP(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	return ip == netip.AddrFrom4([4]byte{127, 0, 0, 1}) || ip == netip.IPv6Loopback()
 }
 
 // splitAddress splits addr into host and port. MongoDB reads an address

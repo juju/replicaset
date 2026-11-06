@@ -2163,11 +2163,23 @@ func (s *changesSuite) TestChangesKeepLocalhostSeparate(c *gc.C) {
 	c.Check(m.repaired, jc.IsFalse)
 }
 
-func (s *changesSuite) TestRemoveDoesNotMatchUnknownLocalhost(c *gc.C) {
-	s.current = []Member{{Id: 1, Address: "127.0.0.1:37017"}}
+func (s *changesSuite) TestRemoveMatchesLocalhost(c *gc.C) {
+	s.current = []Member{{Id: 1, Address: "127.0.0.1:37017"}, {Id: 2, Address: "10.0.0.2:37017"}}
 	m := &mockSession{}
 	c.Assert(Remove(m, "localhost:37017"), jc.ErrorIsNil)
-	c.Check(m.cfg, gc.IsNil)
+	c.Assert(m.cfg, gc.NotNil)
+	c.Check(m.cfg.Members, jc.DeepEquals, []Member{{Id: 2, Address: "10.0.0.2:37017"}})
+}
+
+func (s *changesSuite) TestSetUpdatesLocalhostMemberWithoutId(c *gc.C) {
+	s.current = []Member{{Id: 1, Address: "127.0.0.1:37017"}, {Id: 2, Address: "10.0.0.2:37017"}}
+	m := &mockSession{}
+	err := Set(m, []Member{{Address: "localhost:37017"}, {Id: 2, Address: "10.0.0.2:37017"}})
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, jc.DeepEquals, &Config{
+		Version: 1,
+		Members: []Member{{Id: 1, Address: "localhost:37017"}, {Id: 2, Address: "10.0.0.2:37017"}},
+	})
 }
 
 func (s *changesSuite) TestSameAddress(c *gc.C) {
@@ -2175,7 +2187,7 @@ func (s *changesSuite) TestSameAddress(c *gc.C) {
 		a, b string
 		want bool
 	}{
-		{"127.0.0.1", "localhost", false},
+		{"127.0.0.1", "localhost", true},
 		{"127.0.0.1", "127.0.0.1:27017", true},
 		{"127.0.0.1", "127.0.0.1:37017", false},
 		{"localhost", "localhost:37017", false},
@@ -2185,11 +2197,14 @@ func (s *changesSuite) TestSameAddress(c *gc.C) {
 		{"127.0.0.1:37017", "[::ffff:127.1.0.1]:37017", false},
 		{"[::1]:37017", "[::ffff:127.0.0.1]:37017", false},
 		{"127.0.0.1:37017", "127.0.0.1:37018", false},
-		{"127.0.0.1:37017", "localhost:37017", false},
+		{"[::1]:37017", "localhost:37017", true},
+		{"[::ffff:127.0.0.1]:37017", "localhost:37017", true},
+		{"127.0.0.1:37017", "localhost:37018", false},
+		{"127.0.0.1:37017", "localhost:37017", true},
 		{"[::1]:37017", "127.0.0.1:37017", false},
 		{"127.1.2.3:37017", "localhost:37017", false},
 		{"127.0.0.1.example.com:37017", "localhost:37017", false},
-		{"[::1]", "localhost:27017", false},
+		{"[::1]", "localhost:27017", true},
 		{"[::1]", "localhost:37017", false},
 		{"[fd00::1]", "localhost", false},
 		{"10.0.0.3", "10.0.0.3:27017", true},
@@ -2198,7 +2213,7 @@ func (s *changesSuite) TestSameAddress(c *gc.C) {
 		{"[fd00::1]", "[fd00::1]:27017", true},
 		{"[fd00::1]", "[fd00::1]:37017", false},
 		{"[fd00::1", "[fd00::1]:27017", false},
-		{"::1", "localhost:27017", false},
+		{"::1", "localhost:27017", true},
 		{"::1", "localhost:37017", false},
 		{"0:0:0:0:0:0:0:1", "[::1]:27017", true},
 		{"fd00::1", "[fd00::1]:27017", true},

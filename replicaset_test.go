@@ -2201,6 +2201,8 @@ func (s *changesSuite) TestSameAddress(c *gc.C) {
 		{"[::ffff:127.0.0.1]:37017", "localhost:37017", true},
 		{"127.0.0.1:37017", "localhost:37018", false},
 		{"127.0.0.1:37017", "localhost:37017", true},
+		{"127.0.0.1:37017", "LOCALHOST:37017", true},
+		{"[::1]:37017", "LocalHost:37017", true},
 		{"[::1]:37017", "127.0.0.1:37017", false},
 		{"127.1.2.3:37017", "localhost:37017", false},
 		{"127.0.0.1.example.com:37017", "localhost:37017", false},

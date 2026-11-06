@@ -731,9 +731,9 @@ func sameAddress(a, b string) bool {
 		// Distinct loopback IPs can host different servers on the same port.
 		return ipA.Unmap() == ipB.Unmap()
 	case errA == nil:
-		return hb == "localhost" && localhostIP(ipA)
+		return strings.EqualFold(hb, "localhost") && localhostIP(ipA)
 	case errB == nil:
-		return ha == "localhost" && localhostIP(ipB)
+		return strings.EqualFold(ha, "localhost") && localhostIP(ipB)
 	}
 	return ha == hb
 }

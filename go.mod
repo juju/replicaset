@@ -6,7 +6,7 @@ require (
 	github.com/juju/collections v1.0.0
 	github.com/juju/errors v1.0.0
 	github.com/juju/loggo v1.0.0
-	github.com/juju/mgo/v3 v3.0.2
+	github.com/juju/mgo/v3 v3.0.9
 	github.com/juju/testing v1.0.1
 	github.com/juju/utils/v3 v3.0.0
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c

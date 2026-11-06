@@ -8,7 +8,8 @@ package replicaset
 import (
 	"fmt"
 	"io"
-	"regexp"
+	"net"
+	"net/netip"
 	"sort"
 	"strings"
 	"syscall"
@@ -43,11 +44,13 @@ const (
 var logger = loggo.GetLogger("juju.replicaset")
 
 var (
-	getCurrentConfig = CurrentConfig
-	getCurrentStatus = CurrentStatus
-	getBuildInfo     = BuildInfo
-	isReady          = IsReady
-	attemptInitiate  = doAttemptInitiate
+	getCurrentConfig  = CurrentConfig
+	getSessionConfig  = sessionConfig
+	getPrimarySession = primarySession
+	getCurrentStatus  = CurrentStatus
+	getBuildInfo      = BuildInfo
+	isReady           = IsReady
+	attemptInitiate   = doAttemptInitiate
 )
 
 // doAttemptInitiate will attempt to initiate a mongodb replicaset with each of
@@ -247,11 +250,101 @@ func fmtUpdatedMembersForLog(membersToLog []Member) string {
 // applyReplSetConfigChanges applies the specified changes to the mongo session.
 // It also logs what the changes are.
 func applyReplSetConfigChanges(cmd string, session mgoSession, currentConfig *Config, updated []Member, added []Member, removed []int) error {
+	updatesApplied, err := doReplSetConfigChanges(cmd, session, currentConfig, updated, added, removed)
+	if errors.Is(err, repairNeeded) {
+		if updatesApplied {
+			updated = nil
+		}
+		// A quorum-check failure can happen during update, add, or remove
+		// when a member being removed is down. Repair once by forcing out
+		// confirmed-dead removed members, then retry against the refreshed
+		// config with a normal reconfig. If no member needs forcing out,
+		// nothing is forced first.
+		if repairErr := repairReplicaSet(session, removed); repairErr != nil {
+			return errors.Annotatef(repairErr, "repairing replicaset after %v", err)
+		}
+		if len(updated) == 0 {
+			repairedConfig, err := getSessionConfig(session)
+			if err == nil {
+				removedIds := set.NewInts(removed...)
+				complete := true
+				for _, member := range added {
+					if !memberPresent(repairedConfig.Members, member) {
+						complete = false
+						break
+					}
+				}
+				for _, member := range repairedConfig.Members {
+					if removedIds.Contains(member.Id) {
+						complete = false
+						break
+					}
+				}
+				if complete {
+					return nil
+				}
+			}
+		}
+		retrySession, err := getPrimarySession(session)
+		if err != nil {
+			return err
+		}
+		defer retrySession.Close()
+		repairedConfig, err := getSessionConfig(retrySession)
+		if err != nil {
+			return err
+		}
+		_, err = doReplSetConfigChanges(cmd, retrySession, repairedConfig, updated, added, removed)
+		if errors.Is(err, repairNeeded) {
+			// %v, not Annotatef: don't expose the repairNeeded sentinel to
+			// callers.
+			return errors.Errorf("cannot apply %s changes after replicaset repair attempt: %v", cmd, err)
+		}
+		return err
+	}
+	return err
+}
+
+var primarySessionAttempts = utils.AttemptStrategy{Total: time.Minute, Delay: time.Second}
+
+func primarySession(session mgoSession) (mgoSession, error) {
+	primary := session.Clone()
+	primary.SetMode(mgo.Primary, true)
+	if err := waitForPrimary(primary); err != nil {
+		primary.Close()
+		return nil, err
+	}
+	return primary, nil
+}
+
+func waitForPrimary(session mgoSession) error {
+	var err error
+	for attempt := primarySessionAttempts.Start(); attempt.Next(); {
+		var result *IsMasterResults
+		result, err = IsMaster(session)
+		if err == nil {
+			if result.IsMaster {
+				return nil
+			}
+			err = errors.Errorf("server %q is not primary", result.Address)
+		}
+		// Refresh releases the socket, but mgo may still have stale primary
+		// information until its next background topology check.
+		session.Refresh()
+	}
+	return errors.Annotate(err, "cannot select primary after replicaset repair")
+}
+
+// doReplSetConfigChanges applies the updates, adds and removes one change at a
+// time. Any step whose reconfig loses quorum returns repairNeeded so the caller
+// can force-remove a dead member, if there is one, and retry.
+// The boolean reports whether all updates were applied before returning.
+func doReplSetConfigChanges(cmd string, session mgoSession, currentConfig *Config, updated []Member, added []Member, removed []int) (bool, error) {
 	logger.Debugf("%s() changing replica set\n%s\n- updated:\n%#v\n- added:\n%s\n- removed: %v",
 		cmd, fmtConfigForLog(currentConfig), fmtUpdatedMembersForLog(updated), fmtMembersForLog(added), removed)
 
 	if currentConfig == nil {
-		return errors.New("current config cannot be nil")
+		return false, errors.New("current config cannot be nil")
 	}
 	newConfig := *currentConfig
 	// Mongo 4.4 onwards requires we process one change at a time.
@@ -269,38 +362,39 @@ func applyReplSetConfigChanges(cmd string, session mgoSession, currentConfig *Co
 			break
 		}
 		if !haveChanges {
-			return fmt.Errorf("cannot update member %#v in replicaset, no existing member", u)
+			return false, fmt.Errorf("cannot update member %#v in replicaset, no existing member", u)
 		}
 		newConfig.Version++
 		err := applyReplSetConfig(cmd, session, newConfig)
 		if err != nil {
-			return fmt.Errorf("cannot update member %#v in replicaset: %v", u, err)
+			return false, fmt.Errorf("cannot update member %#v in replicaset: %w", u, err)
 		}
 	}
 	// Then the adds.
 	for _, m := range added {
+		// A post-repair retry may find an already added member.
+		if memberPresent(newConfig.Members, m) {
+			continue
+		}
 		newConfig.Version++
 		newConfig.Members = append(newConfig.Members, m)
 		err := applyReplSetConfig(cmd, session, newConfig)
 		if err != nil {
-			return fmt.Errorf("cannot add member %#v to replicaset: %v", m, err)
+			return true, fmt.Errorf("cannot add member %#v to replicaset: %w", m, err)
 		}
 	}
 
 	// Then do the removes.
-	err := applyRemoves(cmd, session, newConfig, removed)
-	if errors.Is(err, repairNeeded) {
-		// If the replicaset gets out of sync, attempt a repair and retry.
-		if err := repairReplicaSet(session, removed); err != nil {
-			return errors.Annotatef(err, "repairing replicaset")
+	return true, applyRemoves(cmd, session, newConfig, removed)
+}
+
+func memberPresent(members []Member, member Member) bool {
+	for _, existing := range members {
+		if existing.Id == member.Id && sameAddress(existing.Address, member.Address) {
+			return true
 		}
-		updatedConfig, err := getCurrentConfig(session)
-		if err != nil {
-			return err
-		}
-		return applyRemoves(cmd, session, *updatedConfig, removed)
 	}
-	return err
+	return false
 }
 
 func applyRemoves(cmd string, session mgoSession, newConfig Config, removed []int) error {
@@ -349,14 +443,8 @@ var repairNeeded = errors.ConstError("repair needed")
 // If so, it Refreshes the session and tries to Ping again.
 func applyReplSetConfig(cmd string, session mgoSession, newConfig Config) error {
 	err := session.Run(bson.D{{"replSetReconfig", newConfig}}, nil)
-	if err != nil {
-		qe, ok := err.(*mgo.QueryError)
-		// This error occurs when the replicaset changes can't be synced
-		// to all nodes and the primary is forced to become a secondary
-		// because quorum is lost.
-		if ok && qe.Code == 11602 {
-			return repairNeeded
-		}
+	if isQuorumCheckFailure(err) {
+		return fmt.Errorf("%w: %v", repairNeeded, err)
 	}
 	if err == io.EOF {
 		// If the primary changes due to replSetReconfig, then all
@@ -381,76 +469,299 @@ func applyReplSetConfig(cmd string, session mgoSession, newConfig Config) error 
 	return err
 }
 
-// repairReplicaSet will remove any unhealthy nodes that are in the
-// removed list and then force a remaining secondary to become a primary.
+func isQuorumCheckFailure(err error) bool {
+	// Quorum was lost applying the reconfig. The server fails the quorum
+	// check with code 74, which it also uses for other reconfig errors, so
+	// that case is matched by its message. Code 11602 means a stepdown
+	// interrupted the reconfig. Only a QueryError counts, so an unrelated
+	// error can't trigger a force repair.
+	qe, ok := err.(*mgo.QueryError)
+	if !ok || qe == nil {
+		return false
+	}
+	return qe.Code == 11602 || strings.Contains(qe.Message, "Quorum check failed")
+}
+
+// repairReplicaSet removes explicit targets that remain unhealthy and report
+// DOWN or UNKNOWN with a forced reconfig, then waits for a primary to be
+// elected. When no target stays unavailable and nothing else blocks the
+// repair, it forces nothing and only waits for a primary, so the caller
+// retries the change with a normal, quorum-checked reconfig.
 func repairReplicaSet(session mgoSession, removed []int) error {
-	cfg, err := getCurrentConfig(session)
+	if len(removed) == 0 {
+		// Quorum was lost without us asking to remove anything, so there is no
+		// member we are allowed to force out.
+		return errors.Errorf("cannot repair replicaset: no removal targets")
+	}
+
+	cfg, err := getSessionConfig(session)
 	if err != nil {
 		return errors.Annotatef(err, "getting rs config to repair")
 	}
 
-	status, err := getCurrentStatus(session)
-	if err != nil {
-		return errors.Annotatef(err, "getting rs status to repair")
-	}
-
-	cfg.Version++
 	removedIds := set.NewInts(removed...)
-	haveChanges := false
-	haveUnhealthy := false
-	for n, m := range status.Members {
-		haveUnhealthy = haveUnhealthy || !m.Healthy
-		if !m.Healthy && removedIds.Contains(m.Id) {
-			haveChanges = true
-			cfg.Members = append(cfg.Members[:n], cfg.Members[n+1:]...)
-		}
-	}
-	// If there are unhealthy nodes not in the to remove list,
-	// we can't safely repair.
-	if !haveChanges && haveUnhealthy {
-		return errors.Errorf("cannot repair replicaset")
-	}
-	err = session.Run(bson.D{
-		{"replSetReconfig", *cfg},
-		{"force", "true"},
-	}, nil)
+
+	// A forced reconfig skips the quorum check mongo would normally run, so
+	// decide first whether forcing is safe at all (see assessRepairSafety).
+	assessment, err := assessRepairSafety(session, cfg, removedIds)
 	if err != nil {
-		return errors.Annotatef(err, "repairing rs")
+		return err
 	}
-	logger.Infof("replicaset repair done, waiting for new primary")
-	// Poll 5 times.
-	backoffms := 1000.0
-gotprimary:
-	for i := 0; i < 5; i++ {
-		status, err := getCurrentStatus(session)
-		if err != nil {
-			return errors.Annotatef(err, "checking rs status to repair")
-		}
-		for _, m := range status.Members {
-			if m.State == PrimaryState {
-				break gotprimary
+	if !assessment.safe {
+		return errors.Errorf("cannot repair replicaset: %s", assessment.reason)
+	}
+	if assessment.evict.Size() == 0 {
+		// No target stayed DOWN or UNKNOWN, so the quorum failure may be
+		// transient. Forcing would skip the mongo quorum check, so leave the
+		// retry to a normal reconfig instead. The primary may have stepped
+		// down, so still wait for one before the caller retries.
+		logger.Infof("no member of %v in the current config remained DOWN or UNKNOWN, waiting for a primary before retrying without a forced reconfig",
+			removedIds.SortedValues())
+	} else {
+		cfg.Version++
+		var remaining []Member
+		for _, m := range cfg.Members {
+			if assessment.evict.Contains(m.Id) {
+				continue
 			}
+			remaining = append(remaining, m)
 		}
-		logger.Debugf("still waiting for primary...")
-		time.Sleep(time.Duration(backoffms) * time.Millisecond)
-		backoffms *= 1.2
+		cfg.Members = remaining
+		err = session.Run(bson.D{
+			{"replSetReconfig", *cfg},
+			{"force", true},
+		}, nil)
+		if err == io.EOF {
+			// The connection can drop during the forced reconfig.
+			logger.Debugf("got EOF while repairing rs, calling session.Refresh()")
+			session.Refresh()
+		} else if err != nil {
+			return errors.Annotatef(err, "repairing rs")
+		}
+		logger.Infof("replicaset repair done, waiting for new primary")
 	}
-	return nil
+	backoff := primaryPollInterval
+	var statusErr error
+	for i := 0; i < primaryPollAttempts; i++ {
+		var status *Status
+		status, statusErr = getCurrentStatus(session)
+		if statusErr != nil {
+			logger.Warningf("checking rs status to repair: %v", statusErr)
+			session.Refresh()
+		} else {
+			for _, m := range status.Members {
+				if m.State == PrimaryState {
+					return nil
+				}
+			}
+			logger.Debugf("still waiting for primary...")
+		}
+		if i+1 < primaryPollAttempts {
+			time.Sleep(backoff)
+			backoff = time.Duration(float64(backoff) * 1.2)
+		}
+	}
+	if statusErr != nil {
+		return errors.Annotatef(statusErr, "checking rs status to repair")
+	}
+	return errors.Errorf("cannot repair replicaset: no primary elected after %d attempts", primaryPollAttempts)
 }
 
-var localHostIpv4 = regexp.MustCompile(`127\.0\.0\.\d+`)
+const (
+	// confirmDeadSamples is the most status samples assessRepairSafety takes.
+	confirmDeadSamples = 3
 
-func isLocalhost(addr string) bool {
-	return addr == "::1" ||
-		addr == "0:0:0:0:0:0:0:1" ||
-		localHostIpv4.MatchString(addr) ||
-		addr == "localhost"
+	// About 16.5s in total (1s growing 1.2x over 8 sleeps), longer than
+	// mongo's default 10s election timeout.
+	primaryPollAttempts = 9
+)
+
+// These are variables, not constants, so tests can patch them to zero and
+// avoid sleeping.
+var (
+	confirmDeadInterval = 2 * time.Second
+	primaryPollInterval = time.Second
+)
+
+// repairSafetyAssessment says whether the repair may proceed, and which
+// members it may force out. When it may not, reason explains why. With
+// nothing to evict, proceeding means only a normal retry, not a forced
+// reconfig.
+type repairSafetyAssessment struct {
+	safe   bool
+	reason string
+	evict  set.Ints
+}
+
+// assessRepairSafety re-samples the replicaset status to decide whether a
+// forced reconfig is needed and safe.
+// Only members in cfg are considered. A targeted member is evictable only when
+// it is unhealthy and reports DOWN or UNKNOWN in every sample. It does not
+// count as healthy for majority.
+// Repair is refused if an untargeted voter is unhealthy in every sample. If
+// no target qualifies, the repair is then safe with nothing to evict.
+// Otherwise it is also refused if the consistently healthy remaining voters
+// lack a majority, or none of those voters can become primary.
+func assessRepairSafety(session mgoSession, cfg *Config, removed set.Ints) (*repairSafetyAssessment, error) {
+	// Voting members form the election majority, while only data-bearing voters
+	// with positive priority can become primary.
+	members := set.NewInts()
+	voting := set.NewInts()
+	primaryEligible := set.NewInts()
+	for _, m := range cfg.Members {
+		members.Add(m.Id)
+		if hasVote(m) {
+			voting.Add(m.Id)
+		}
+		if canBecomePrimary(m) {
+			primaryEligible.Add(m.Id)
+		}
+	}
+
+	var deadRemoved, liveVoting, livePrimaryEligible, unhealthyOtherVoting set.Ints
+	for i := 0; i < confirmDeadSamples; i++ {
+		if i > 0 {
+			time.Sleep(confirmDeadInterval)
+		}
+		status, err := getCurrentStatus(session)
+		if err != nil {
+			return nil, errors.Annotatef(err, "getting rs status to assess repair safety")
+		}
+
+		deadRemovedNow := set.NewInts()
+		liveVotingNow := set.NewInts()
+		livePrimaryEligibleNow := set.NewInts()
+		unhealthyOtherVotingNow := set.NewInts()
+		for _, m := range status.Members {
+			// The status can list a member that the config we are about to
+			// force no longer has, so ignore it rather than act on it.
+			if !members.Contains(m.Id) {
+				continue
+			}
+			if m.Healthy {
+				if voting.Contains(m.Id) {
+					liveVotingNow.Add(m.Id)
+				}
+				if primaryEligible.Contains(m.Id) && (m.State == PrimaryState || m.State == SecondaryState) {
+					livePrimaryEligibleNow.Add(m.Id)
+				}
+				continue
+			}
+			if removed.Contains(m.Id) && (m.State == DownState || m.State == UnknownState) {
+				deadRemovedNow.Add(m.Id)
+			}
+			if !voting.Contains(m.Id) {
+				continue
+			}
+			if !removed.Contains(m.Id) {
+				unhealthyOtherVotingNow.Add(m.Id)
+			}
+		}
+
+		if i == 0 {
+			deadRemoved, liveVoting, livePrimaryEligible, unhealthyOtherVoting =
+				deadRemovedNow, liveVotingNow, livePrimaryEligibleNow, unhealthyOtherVotingNow
+		} else {
+			deadRemoved = deadRemoved.Intersection(deadRemovedNow)
+			liveVoting = liveVoting.Intersection(liveVotingNow)
+			livePrimaryEligible = livePrimaryEligible.Intersection(livePrimaryEligibleNow)
+			unhealthyOtherVoting = unhealthyOtherVoting.Intersection(unhealthyOtherVotingNow)
+		}
+		if deadRemoved.Size() == 0 && unhealthyOtherVoting.Size() == 0 {
+			// Nothing left to evict or to block on, so more samples cannot
+			// change the outcome.
+			break
+		}
+	}
+
+	// Check the untargeted voters first, so a persistently down voter is
+	// reported even when every target has recovered.
+	if unhealthyOtherVoting.Size() > 0 {
+		// Members we were not asked to remove are also unhealthy, so we cannot
+		// tell this apart from a wider outage.
+		return &repairSafetyAssessment{
+			reason: fmt.Sprintf("voters %v are unhealthy but not in the removal targets %v",
+				unhealthyOtherVoting.SortedValues(), removed.SortedValues()),
+		}, nil
+	}
+	if deadRemoved.Size() == 0 {
+		return &repairSafetyAssessment{safe: true, evict: deadRemoved}, nil
+	}
+
+	// The eviction must leave enough live voters to elect a primary.
+	evictVoting := deadRemoved.Intersection(voting)
+	remainingVoters := voting.Difference(evictVoting)
+	liveVoters := liveVoting.Difference(evictVoting)
+	needed := (remainingVoters.Size() / 2) + 1
+	if liveVoters.Size() < needed {
+		return &repairSafetyAssessment{
+			reason: fmt.Sprintf("evicting %v leaves live voters %v of %v, but a majority needs %d",
+				evictVoting.SortedValues(), liveVoters.SortedValues(), remainingVoters.SortedValues(), needed),
+		}, nil
+	}
+	if livePrimaryEligible.Size() == 0 {
+		return &repairSafetyAssessment{
+			reason: fmt.Sprintf("evicting %v leaves no live primary-eligible member among voters %v",
+				deadRemoved.SortedValues(), remainingVoters.SortedValues()),
+		}, nil
+	}
+
+	return &repairSafetyAssessment{safe: true, evict: deadRemoved}, nil
+}
+
+func sameAddress(a, b string) bool {
+	if a == b {
+		return true
+	}
+	ha, pa, err := splitAddress(a)
+	if err != nil {
+		return false
+	}
+	hb, pb, err := splitAddress(b)
+	if err != nil {
+		return false
+	}
+	if pa != pb {
+		return false
+	}
+	ipA, errA := netip.ParseAddr(ha)
+	ipB, errB := netip.ParseAddr(hb)
+	switch {
+	case errA == nil && errB == nil:
+		// Distinct loopback IPs can host different servers on the same port.
+		return ipA.Unmap() == ipB.Unmap()
+	case errA == nil:
+		return strings.EqualFold(hb, "localhost") && localhostIP(ipA)
+	case errB == nil:
+		return strings.EqualFold(ha, "localhost") && localhostIP(ipB)
+	}
+	return ha == hb
+}
+
+func localhostIP(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	return ip == netip.AddrFrom4([4]byte{127, 0, 0, 1}) || ip == netip.AddrFrom16([16]byte{15: 1})
+}
+
+// splitAddress splits addr into host and port. MongoDB reads an address
+// without a port as port 27017. SplitHostPort rejects a bare IPv6 address
+// even with a port added, so a bare IP address is taken as the host.
+func splitAddress(addr string) (string, string, error) {
+	if host, port, err := net.SplitHostPort(addr); err == nil {
+		return host, port, nil
+	}
+	if _, err := netip.ParseAddr(addr); err == nil {
+		return addr, "27017", nil
+	}
+	return net.SplitHostPort(addr + ":27017")
 }
 
 // Add adds the given members to the session's replica set.  Duplicates of
 // existing replicas will be ignored.
 //
-// Members will have their Ids set automatically if they are not already > 0
+// Members will have their Ids set automatically if they are not already > 0.
+// Add removes no members, so if a reconfig loses quorum it returns an error
+// rather than force-removing anything.
 func Add(session mgoSession, members ...Member) error {
 	config, err := getCurrentConfig(session)
 	if err != nil {
@@ -463,8 +774,7 @@ func Add(session mgoSession, members ...Member) error {
 outerLoop:
 	for _, newMember := range members {
 		for _, member := range config.Members {
-			if member.Address == newMember.Address ||
-				isLocalhost(member.Address) && isLocalhost(newMember.Address) {
+			if sameAddress(member.Address, newMember.Address) {
 				// already exists, skip it
 				continue outerLoop
 			}
@@ -481,6 +791,11 @@ outerLoop:
 
 // Remove removes members with the given addresses from the replica set. It is
 // not an error to remove addresses of non-existent replica set members.
+// If a reconfig loses quorum, members being removed that stay DOWN or UNKNOWN
+// may be force-removed and, unless the repair is refused or fails, the change
+// is retried once.
+// Retrying pending changes on another primary requires a session that allows
+// replica set discovery rather than a direct connection.
 func Remove(session mgoSession, addrs ...string) error {
 	config, err := getCurrentConfig(session)
 	if err != nil {
@@ -489,8 +804,7 @@ func Remove(session mgoSession, addrs ...string) error {
 	var toRemove []int
 	for _, rem := range addrs {
 		for _, repl := range config.Members {
-			if repl.Address == rem ||
-				isLocalhost(repl.Address) && isLocalhost(rem) {
+			if sameAddress(repl.Address, rem) {
 				toRemove = append(toRemove, repl.Id)
 				break
 			}
@@ -520,8 +834,20 @@ func hasVote(m Member) bool {
 	return m.Votes == nil || *m.Votes > 0
 }
 
+func canBecomePrimary(m Member) bool {
+	if !hasVote(m) || (m.Arbiter != nil && *m.Arbiter) {
+		return false
+	}
+	return m.Priority == nil || *m.Priority > 0
+}
+
 // Set changes the current set of replica set members.  Members will have their
 // ids set automatically if their ids are not already > 0.
+// If a reconfig loses quorum, members being removed that stay DOWN or UNKNOWN
+// may be force-removed and, unless the repair is refused or fails, the change
+// is retried once.
+// Retrying pending changes on another primary requires a session that allows
+// replica set discovery rather than a direct connection.
 func Set(session mgoSession, members []Member) error {
 	config, err := getCurrentConfig(session)
 	if err != nil {
@@ -552,9 +878,35 @@ func Set(session mgoSession, members []Member) error {
 		votes   = 1
 	)
 	updatedIds := set.NewInts()
+	// An existing member that moves to another address frees its old one.
 	for _, m := range members {
-		existingMember, ok := existingMembers[m.Id]
-		if ok {
+		if existing, ok := existingMembers[m.Id]; ok && m.Id > 0 && existing.Address != m.Address {
+			delete(existingAddressIds, existing.Address)
+		}
+	}
+	for _, m := range members {
+		// A wanted member at an existing address updates that member in
+		// place, reusing its Id, rather than adding a duplicate host.
+		id, ok := existingAddressIds[m.Address]
+		// Otherwise take the first existing address that sameAddress matches.
+		if !ok {
+			for _, e := range config.Members {
+				if _, left := existingAddressIds[e.Address]; left && sameAddress(e.Address, m.Address) {
+					id, ok = e.Id, true
+					break
+				}
+			}
+		}
+		if ok && m.Id != id {
+			if m.Id > 0 {
+				return fmt.Errorf("cannot set member %d: address %q already used by member %d", m.Id, m.Address, id)
+			}
+			m.Id = id
+		}
+		// A member given without an Id has Id 0, so it is member 0 only
+		// when its address matched member 0.
+		existingMember, exists := existingMembers[m.Id]
+		if exists && (ok || m.Id > 0) {
 			if existingMember.Address != m.Address || hasVote(existingMember) != hasVote(m) {
 				updatedIds.Add(m.Id)
 				updated = append(updated, m)
@@ -646,11 +998,20 @@ func CurrentMembers(session mgoSession) ([]Member, error) {
 // CurrentConfig returns the Config for the given session's replica set.  If
 // there is no current config, the error returned will be mgo.ErrNotFound.
 func CurrentConfig(session mgoSession) (*Config, error) {
-	cfg := &Config{}
 	monotonicSession := session.Clone()
 	defer monotonicSession.Close()
 	monotonicSession.SetMode(mgo.Monotonic, true)
-	err := monotonicSession.DB("local").C("system.replset").Find(nil).One(cfg)
+	return sessionConfig(monotonicSession)
+}
+
+// sessionConfig reads the config through session itself, so from the server
+// its commands go to. Repair runs its reconfig commands there, so it must not
+// read an older copy from another member. Mongo serves local reads on a
+// secondary, so this still works after that server steps down on losing
+// quorum.
+func sessionConfig(session mgoSession) (*Config, error) {
+	cfg := &Config{}
+	err := session.DB("local").C("system.replset").Find(nil).One(cfg)
 	if err == mgo.ErrNotFound {
 		return nil, err
 	}
@@ -688,14 +1049,14 @@ func StepDownPrimary(session mgoSession) error {
 	strictSession := session.Clone()
 	defer strictSession.Close()
 	// StepDown can only be called on the primary
-	session.SetMode(mgo.Primary, true)
+	strictSession.SetMode(mgo.Primary, true)
 	// replSetStepDown takes a few optional parameters that vary based on what
 	// version of Mongo is running. In Mongo 2.4 it just takes the "step down
 	// seconds" which claims to default to 60s.
 	// In 3.2 it can also take secondaryCatchUpPeriodSecs which is supposed to
 	// start at 10s. However, testing shows that not passing either gives:
 	// err{"stepdown period must be longer than secondaryCatchUpPeriodSecs"}
-	err := session.Run(bson.D{{"replSetStepDown", 60.0}}, nil)
+	err := strictSession.Run(bson.D{{"replSetStepDown", 60.0}}, nil)
 	// we expect to get io.EOF so don't treat it as a failure.
 	if err == io.EOF {
 		return nil
@@ -713,7 +1074,7 @@ func CurrentStatus(session mgoSession) (*Status, error) {
 	status := &Status{}
 	err := session.Run("replSetGetStatus", status)
 	if err != nil {
-		return nil, fmt.Errorf("cannot get replica set status: %v", err)
+		return nil, errors.Annotate(err, "cannot get replica set status")
 	}
 
 	for index, member := range status.Members {

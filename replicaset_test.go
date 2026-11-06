@@ -33,8 +33,8 @@ type MongoSuite struct {
 	root *mgotesting.MgoInstance
 }
 
-func newServer(c *gc.C) *mgotesting.MgoInstance {
-	inst := &mgotesting.MgoInstance{Params: []string{"--replSet", rsName}}
+func newServer(c *gc.C, params ...string) *mgotesting.MgoInstance {
+	inst := &mgotesting.MgoInstance{Params: append([]string{"--replSet", rsName}, params...)}
 	err := inst.Start(nil)
 	c.Assert(err, jc.ErrorIsNil)
 
@@ -231,7 +231,7 @@ func (s *MongoSuite) TestAddRemoveSet(c *gc.C) {
 	assertAddRemoveSet(c, s.root, getAddr)
 }
 
-func assertAddRemoveSet(c *gc.C, root *mgotesting.MgoInstance, getAddr func(*mgotesting.MgoInstance) string) {
+func assertAddRemoveSet(c *gc.C, root *mgotesting.MgoInstance, getAddr func(*mgotesting.MgoInstance) string, params ...string) {
 	session := root.MustDial()
 	defer session.Close()
 
@@ -253,7 +253,7 @@ func assertAddRemoveSet(c *gc.C, root *mgotesting.MgoInstance, getAddr func(*mgo
 	instances := make([]*mgotesting.MgoInstance, 5)
 	instances[0] = root
 	for i := 1; i < len(instances); i++ {
-		inst := newServer(c)
+		inst := newServer(c, params...)
 		instances[i] = inst
 		// no need to Remove the instances from the replicaset as
 		// we're destroying the replica set immediately afterwards
@@ -1043,6 +1043,10 @@ func (s *MongoSuite) TestPrimarySessionPreservesTLSAndAuth(c *gc.C) {
 	c.Check(original.Ping(), jc.ErrorIsNil)
 }
 
+// The mgo test harness binds mongod to localhost, which may resolve only to
+// 127.0.0.1, so the IPv6 tests bind to all addresses to reach [::1].
+var ipv6Params = []string{"--bind_ip_all"}
+
 func ipv6GetAddr(inst *mgotesting.MgoInstance) string {
 	return fmt.Sprintf("[::1]:%v", inst.Port())
 }
@@ -1059,14 +1063,14 @@ func (s *MongoIPV6Suite) SetUpTest(c *gc.C) {
 }
 
 func (s *MongoIPV6Suite) TestAddRemoveSetIPv6(c *gc.C) {
-	root := newServer(c)
+	root := newServer(c, ipv6Params...)
 	defer root.Destroy()
 	dialAndTestInitiate(c, root, ipv6GetAddr(root))
-	assertAddRemoveSet(c, root, ipv6GetAddr)
+	assertAddRemoveSet(c, root, ipv6GetAddr, ipv6Params...)
 }
 
 func (s *MongoIPV6Suite) TestAddressFixing(c *gc.C) {
-	root := newServer(c)
+	root := newServer(c, ipv6Params...)
 	defer root.Destroy()
 	dialAndTestInitiate(c, root, ipv6GetAddr(root))
 	session := root.MustDial()

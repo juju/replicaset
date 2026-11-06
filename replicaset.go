@@ -740,7 +740,7 @@ func sameAddress(a, b string) bool {
 
 func localhostIP(ip netip.Addr) bool {
 	ip = ip.Unmap()
-	return ip == netip.AddrFrom4([4]byte{127, 0, 0, 1}) || ip == netip.IPv6Loopback()
+	return ip == netip.AddrFrom4([4]byte{127, 0, 0, 1}) || ip == netip.AddrFrom16([16]byte{15: 1})
 }
 
 // splitAddress splits addr into host and port. MongoDB reads an address

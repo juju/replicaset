@@ -6,8 +6,6 @@ package replicaset
 import (
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	stdtesting "testing"
@@ -1011,24 +1009,18 @@ func (s *MongoSuite) TestPrimarySessionPreservesTLSAndAuth(c *gc.C) {
 	c.Assert(err, jc.ErrorIsNil)
 	serverCert, serverKey, err := cert.ParseCertAndKey(certPEM, keyPEM)
 	c.Assert(err, jc.ErrorIsNil)
-	certDir := c.MkDir()
-	caFile := filepath.Join(certDir, "ca.pem")
-	c.Assert(os.WriteFile(caFile, []byte(certPEM), 0600), jc.ErrorIsNil)
-	serverFile := filepath.Join(certDir, "server.pem")
-	c.Assert(os.WriteFile(serverFile, []byte(certPEM+keyPEM), 0600), jc.ErrorIsNil)
+	certs := &mgotesting.Certs{
+		CACert:     serverCert,
+		ServerCert: serverCert,
+		ServerKey:  serverKey,
+	}
 	inst := &mgotesting.MgoInstance{
-		Params: []string{
-			"--replSet", rsName, "--sslMode", "requireSSL",
-			"--sslPEMKeyFile", serverFile, "--sslCAFile", caFile,
-			"--sslAllowConnectionsWithoutCertificates",
-		},
+		Params:     []string{"--replSet", rsName},
 		EnableAuth: true,
 	}
-	c.Assert(inst.Start(nil), jc.ErrorIsNil)
+	c.Assert(inst.Start(certs), jc.ErrorIsNil)
 	defer inst.Destroy()
-	dialInfo := mgotesting.MgoDialInfo(&mgotesting.Certs{
-		CACert: serverCert, ServerCert: serverCert, ServerKey: serverKey,
-	}, inst.Addr())
+	dialInfo := mgotesting.MgoDialInfo(certs, inst.Addr())
 	directInfo := *dialInfo
 	directInfo.Direct = true
 	original, err := mgo.DialWithInfo(&directInfo)
